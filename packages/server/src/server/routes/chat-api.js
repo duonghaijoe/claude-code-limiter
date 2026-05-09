@@ -7,7 +7,8 @@ const router = express.Router();
 const db = require('../db');
 const { authenticate } = require('../services/auth');
 const { evaluateBalance } = require('../services/limiter');
-const { summaryForUser } = require('../services/usage');
+const { summaryForUser, recordTurn } = require('../services/usage');
+const broker = require('../services/broker');
 
 router.use(authenticate);
 
@@ -116,6 +117,114 @@ router.get('/sessions/:id/messages', async (req, res, next) => {
     const messages = await db.listMessages(session.id);
     res.json({ messages });
   } catch (err) { next(err); }
+});
+
+// POST /sessions/:id/messages
+//   Body: { content: string, model?: string }
+//   Streams SSE: pod events relayed through, then a final `event: meta` carrying credit_cost.
+//   Pre-flight quota check + post-turn usage record.
+router.post('/sessions/:id/messages', async (req, res, next) => {
+  try {
+    const session = await db.getSession(req.params.id);
+    if (!session || session.user_id !== req.user.id) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+    const project = await db.getProject(session.project_id);
+    if (!project) return res.status(404).json({ error: 'Project missing' });
+
+    const { content, model } = req.body || {};
+    if (!content || typeof content !== 'string') {
+      return res.status(400).json({ error: 'content required' });
+    }
+
+    const balance = await evaluateBalance(req.user);
+    if (!balance.allowed) {
+      return res.status(402).json({ error: 'quota_exhausted', balance });
+    }
+
+    await db.appendMessage({ sessionId: session.id, role: 'user', content });
+
+    let routed;
+    try {
+      routed = await broker.route({
+        user: req.user,
+        session,
+        project,
+        prompt: content,
+        model,
+      });
+    } catch (err) {
+      if (err instanceof broker.BrokerError) {
+        return res.status(err.status).json({ error: err.code, detail: err.message });
+      }
+      throw err;
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    const send = (event, data) => {
+      res.write(`event: ${event}\n`);
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+    };
+
+    let assistantText = '';
+    let usage = null;
+    let resultModel = model || null;
+
+    try {
+      for await (const evt of routed.events) {
+        send(evt.event, evt.data);
+        if (evt.event === 'result' && evt.data && evt.data.type === 'result') {
+          if (typeof evt.data.result === 'string') assistantText = evt.data.result;
+          if (evt.data.usage) usage = evt.data.usage;
+          if (evt.data.model) resultModel = evt.data.model;
+        }
+      }
+    } catch (err) {
+      send('error', { error: 'stream_error', detail: err.message });
+      res.end();
+      return;
+    }
+
+    let creditCost = 0;
+    if (usage) {
+      try {
+        const turn = await recordTurn({
+          user: req.user,
+          subscriptionId: routed.subscription.id,
+          sessionId: session.id,
+          model: resultModel || 'unknown',
+          tokens: {
+            inputTokens: usage.input_tokens || 0,
+            outputTokens: usage.output_tokens || 0,
+            cacheReadTokens: usage.cache_read_input_tokens || 0,
+            cacheCreateTokens: usage.cache_creation_input_tokens || 0,
+          },
+        });
+        creditCost = turn.creditCost;
+      } catch (err) {
+        send('error', { error: 'record_usage_failed', detail: err.message });
+      }
+    }
+
+    if (assistantText) {
+      try {
+        await db.appendMessage({ sessionId: session.id, role: 'assistant', content: assistantText });
+      } catch (err) {
+        send('error', { error: 'append_message_failed', detail: err.message });
+      }
+    }
+
+    send('meta', { credit_cost: creditCost, subscription_id: routed.subscription.id });
+    send('done', { ok: true });
+    res.end();
+  } catch (err) {
+    if (!res.headersSent) return next(err);
+    res.end();
+  }
 });
 
 module.exports = router;
