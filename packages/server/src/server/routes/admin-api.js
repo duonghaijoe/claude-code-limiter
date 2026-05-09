@@ -3,7 +3,7 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../db');
-const { hashPassword, authenticate, requireAdmin } = require('../services/auth');
+const { hashPassword, createJWT, authenticate, requireAdmin } = require('../services/auth');
 const { evaluateBalance } = require('../services/limiter');
 
 router.use(authenticate, requireAdmin);
@@ -195,6 +195,24 @@ router.delete('/subscriptions/:id', async (req, res, next) => {
   try {
     await db.deleteSubscription(req.params.id);
     res.json({ deleted: true });
+  } catch (err) { next(err); }
+});
+
+// Mint a short-lived ticket the admin browser uses to attach to
+// /ws/admin/sub-auth and walk through `claude setup-token` interactively.
+router.post('/subscriptions/:id/auth/start', async (req, res, next) => {
+  try {
+    const sub = await db.getSubscription(req.params.id);
+    if (!sub) return res.status(404).json({ error: 'Subscription not found' });
+
+    const ticket = createJWT(
+      { purpose: 'sub-auth', subscriptionId: sub.id, adminId: req.user.id },
+      '5m'
+    );
+
+    // Build a relative ws_url; the client decides ws vs wss based on its own scheme.
+    const wsUrl = `/ws/admin/sub-auth?ticket=${encodeURIComponent(ticket)}`;
+    res.json({ ticket, ws_url: wsUrl, expires_in: 300 });
   } catch (err) { next(err); }
 });
 

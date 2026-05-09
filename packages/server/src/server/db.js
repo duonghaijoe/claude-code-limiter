@@ -67,17 +67,23 @@ async function runMigrations() {
     );
 
     CREATE TABLE IF NOT EXISTS subscription (
-      id              TEXT PRIMARY KEY,
-      pool_id         TEXT NOT NULL REFERENCES pool(id) ON DELETE CASCADE,
-      pod_name        TEXT NOT NULL UNIQUE,
-      pod_endpoint    TEXT NOT NULL,
-      login_email     TEXT NOT NULL,
-      status          TEXT NOT NULL DEFAULT 'pending_auth',
-      cool_down_until TIMESTAMPTZ,
-      last_health     TIMESTAMPTZ,
-      notes           TEXT,
-      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      id                    TEXT PRIMARY KEY,
+      pool_id               TEXT NOT NULL REFERENCES pool(id) ON DELETE CASCADE,
+      pod_name              TEXT NOT NULL UNIQUE,
+      pod_endpoint          TEXT NOT NULL,
+      login_email           TEXT NOT NULL,
+      status                TEXT NOT NULL DEFAULT 'pending_auth',
+      oauth_token           TEXT,
+      oauth_token_added_at  TIMESTAMPTZ,
+      cool_down_until       TIMESTAMPTZ,
+      last_health           TIMESTAMPTZ,
+      notes                 TEXT,
+      created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+
+    -- Forward migration for existing DBs that already had subscription without oauth columns.
+    ALTER TABLE subscription ADD COLUMN IF NOT EXISTS oauth_token TEXT;
+    ALTER TABLE subscription ADD COLUMN IF NOT EXISTS oauth_token_added_at TIMESTAMPTZ;
 
     CREATE TABLE IF NOT EXISTS project (
       id              TEXT PRIMARY KEY,
@@ -344,6 +350,18 @@ async function updateSubscription(id, fields) {
   return getSubscription(id);
 }
 
+async function setSubscriptionOAuth(id, oauthToken) {
+  await query(
+    `UPDATE subscription
+        SET oauth_token = $1,
+            oauth_token_added_at = NOW(),
+            status = 'active'
+      WHERE id = $2`,
+    [oauthToken, id]
+  );
+  return getSubscription(id);
+}
+
 async function deleteSubscription(id) {
   await query('DELETE FROM subscription WHERE id = $1', [id]);
 }
@@ -601,6 +619,7 @@ module.exports = {
   getSubscription,
   createSubscription,
   updateSubscription,
+  setSubscriptionOAuth,
   deleteSubscription,
   // projects/sessions/messages
   listProjects,

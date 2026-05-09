@@ -1,8 +1,10 @@
-# Local dev stack: Postgres + portal server.
-# Subscription pods run from a separate compose file (Phase 2).
+# Local dev stack: Postgres + portal server + one example subscription pod.
+# Subscription pods are normally provisioned dynamically by the portal admin
+# (one pod per Claude subscription); the `sub-pod-1` service below exists so
+# Phase 2 / Phase 3 can be smoke-tested end-to-end on a laptop without K8s.
 #
-# Run with the workspace dir on your host bind-mounted to /workspaces in the container,
-# so projects created via the chat API get a real backing dir on disk.
+# The portal-server mounts /var/run/docker.sock so it can `docker exec`
+# into pods to run `claude setup-token` interactively over the admin WS.
 
 services:
   postgres:
@@ -47,6 +49,29 @@ services:
       # Bind your local workspaces dir into the container so created projects exist on disk.
       # Override with WORKSPACES_HOST_DIR=/path/on/your/mac.
       - ${WORKSPACES_HOST_DIR:-./.workspaces}:/workspaces
+      # Docker socket so the portal can exec into subscription pods for `claude setup-token`.
+      - /var/run/docker.sock:/var/run/docker.sock
+    # Run as root inside the container so it can access the docker socket.
+    # In a real deployment, gate this with a dedicated `docker` group GID.
+    user: "0:0"
+
+  # Example subscription pod. Register it in the portal admin UI with
+  # pod_name=sub-pod-1, pod_endpoint=http://sub-pod-1:4000.
+  sub-pod-1:
+    build:
+      context: ../pod-runtime
+      dockerfile: Dockerfile
+    container_name: sub-pod-1
+    restart: unless-stopped
+    environment:
+      PORT: 4000
+    volumes:
+      # Same workspace bind so /workspaces paths resolve identically across server and pod.
+      - ${WORKSPACES_HOST_DIR:-./.workspaces}:/workspaces
+    expose:
+      - "4000"
+    # During smoke-testing without real Anthropic OAuth, override SUB_AUTH_CMD
+    # on the *server* side (not here) to point at a stub command that prints sk-ant-oat-...
 
 volumes:
   postgres-data:

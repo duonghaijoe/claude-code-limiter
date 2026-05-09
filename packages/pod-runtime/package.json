@@ -1,0 +1,18 @@
+{
+  "name": "@howincodes/claude-code-limiter-pod-runtime",
+  "version": "2.0.0-alpha.0",
+  "description": "Subscription pod runtime: HTTP server that runs Claude Agent SDK turns against a Claude Pro/Max subscription token.",
+  "main": "src/index.js",
+  "bin": { "claude-portal-pod": "./bin/pod.js" },
+  "scripts": {
+    "start": "node bin/pod.js",
+    "dev": "node --watch bin/pod.js"
+  },
+  "files": ["bin/", "src/", "Dockerfile"],
+  "engines": { "node": ">=20.0.0" },
+  "dependencies": {
+    "express": "^4.21.0",
+    "@anthropic-ai/claude-agent-sdk": "^0.2.0"
+  },
+  "license": "MIT"
+}
