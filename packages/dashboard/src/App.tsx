@@ -10,6 +10,7 @@ import { TiersPage } from './pages/TiersPage';
 import { PoolsPage } from './pages/PoolsPage';
 import { SubscriptionsPage } from './pages/SubscriptionsPage';
 import { EventsPage } from './pages/EventsPage';
+import { ChatLayout } from './pages/chat/ChatLayout';
 import { useState } from 'react';
 
 function AuthenticatedLayout() {
@@ -64,6 +65,14 @@ function AuthGuard({ children }: { children: React.ReactNode }) {
   return <>{children}</>;
 }
 
+function AdminGuard({ children }: { children: React.ReactNode }) {
+  const stored = api.getStoredUser();
+  if (stored && stored.role !== 'admin') {
+    return <Navigate to="/chat" replace />;
+  }
+  return <>{children}</>;
+}
+
 export default function App() {
   return (
     <Routes>
@@ -72,7 +81,17 @@ export default function App() {
         path="/dashboard/*"
         element={
           <AuthGuard>
-            <AuthenticatedLayout />
+            <AdminGuard>
+              <AuthenticatedLayout />
+            </AdminGuard>
+          </AuthGuard>
+        }
+      />
+      <Route
+        path="/chat/*"
+        element={
+          <AuthGuard>
+            <ChatLayout />
           </AuthGuard>
         }
       />

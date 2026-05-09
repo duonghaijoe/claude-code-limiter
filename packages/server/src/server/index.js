@@ -29,10 +29,12 @@ app.use((req, res, next) => {
   next();
 });
 
-// Static dashboard.
+// Static SPA. The dashboard build serves both /dashboard/* (admin) and /chat/* (member).
 const dashboardDir = path.join(__dirname, '..', '..', '..', 'dashboard', 'dist');
 app.use('/dashboard', express.static(dashboardDir));
+app.use('/chat', express.static(dashboardDir));
 app.get('/dashboard/*', (req, res) => res.sendFile(path.join(dashboardDir, 'index.html')));
+app.get('/chat/*', (req, res) => res.sendFile(path.join(dashboardDir, 'index.html')));
 
 // API routes.
 app.use('/api/auth', authApi);

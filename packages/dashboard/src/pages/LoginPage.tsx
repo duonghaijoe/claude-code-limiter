@@ -20,8 +20,8 @@ export function LoginPage() {
     setLoading(true);
     setError('');
     try {
-      await api.login(email, password);
-      navigate('/dashboard/', { replace: true });
+      const { user } = await api.login(email, password);
+      navigate(user.role === 'admin' ? '/dashboard/' : '/chat', { replace: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Login failed');
     } finally {
