@@ -1,168 +1,111 @@
 /* ================================================================
-   Shared TypeScript types for the Claude Code Limiter dashboard
+   Admin domain types — QE portal
    ================================================================ */
 
-export interface LimitRule {
-  id?: string;
-  type: 'per_model' | 'credits' | 'time_of_day';
-  model?: string;
-  window?: string;
-  value?: number;
-  schedule_start?: string;
-  schedule_end?: string;
-  schedule_tz?: string;
+export type WindowType = 'daily' | 'weekly' | 'monthly' | 'sliding_24h';
+
+export type UserRole = 'admin' | 'member';
+export type UserStatus = 'active' | 'paused' | 'killed';
+
+export interface Balance {
+  allowed: boolean;
+  budget: number;
+  granted: number;
+  spent: number;
+  remaining: number;
+  window_type: WindowType;
+  window_start?: string;
+  reason?: string;
 }
 
-export interface Device {
-  id: string;
-  hostname: string;
-  platform: string;
-  arch: string;
-  os_version: string;
-  claude_version: string;
-  last_seen: string;
-  last_ip: string;
-}
-
-export interface UsageCounts {
-  [model: string]: number;
-}
-
-export interface UsageSummary {
-  daily?: { counts: UsageCounts };
-  weekly?: { counts: UsageCounts };
-  monthly?: { counts: UsageCounts };
+export interface CreditWeights {
+  per_input_token?: number;
+  per_output_token?: number;
+  per_cache_read_token?: number;
+  per_cache_create_token?: number;
+  [key: string]: number | undefined;
 }
 
 export interface User {
   id: string;
-  slug: string;
+  email: string;
   name: string;
-  status: 'active' | 'paused' | 'killed';
-  killed_at: string | null;
+  tier_id: string | null;
+  role: UserRole;
+  status: UserStatus;
   last_seen: string | null;
-  last_session: string | null;
   created_at: string;
-  limits: LimitRule[];
-  usage: UsageSummary;
-  credit_balance: number | null;
-  credit_budget: number | null;
-  devices: Device[];
+  balance?: Balance;
 }
 
-export interface Team {
+export interface Tier {
   id: string;
   name: string;
+  credit_budget: number;
+  window_type: WindowType;
+  allowed_pools: string[];
+  failover_pools: string[];
   credit_weights: CreditWeights;
+  created_at?: string;
 }
 
-export interface CreditWeights {
-  opus: number;
-  sonnet: number;
-  haiku: number;
-  [key: string]: number;
+export interface Pool {
+  id: string;
+  name: string;
+  plan: string;
+  created_at?: string;
 }
 
-export interface UsageEvent {
+export type SubscriptionStatus = 'pending_auth' | 'active' | 'cool_down' | 'disabled';
+
+export interface Subscription {
+  id: string;
+  pool_id: string;
+  pod_name: string;
+  pod_endpoint: string;
+  login_email: string;
+  status: SubscriptionStatus;
+  oauth_token: string | null;
+  oauth_token_added_at: string | null;
+  cool_down_until: string | null;
+  last_health: string | null;
+  notes: string | null;
+  created_at?: string;
+}
+
+export interface Grant {
   id: string;
   user_id: string;
-  user_name: string;
-  model: string;
-  credit_cost: number;
-  timestamp: string;
+  amount: number;
+  reason: string | null;
+  granted_by: string | null;
+  granted_at: string;
+  expires_at: string;
 }
 
-export interface DailyUsageRow {
-  day: string;
-  user_id?: string;
-  user_name?: string;
-  model: string;
-  count: number;
-  credits: number;
-}
-
-export interface AnalyticsData {
-  avg_prompt_length: number;
-  avg_response_length: number;
-  avg_prompts_per_session: number;
-  block_rate: {
-    total: number;
-    blocked: number;
-    rate: number;
-  };
-  model_distribution: { [model: string]: number };
-  peak_hours: Array<{ hour: number; count: number }>;
-  daily_active: Array<{ date: string; users: number }>;
-  project_usage: Array<{ project: string; count: number }>;
-  devices: Array<Device & { user_name?: string; user_slug?: string }>;
-}
-
-export interface CreateUserPayload {
-  name: string;
-  slug: string;
-  limits?: LimitRule[];
-}
-
-export interface UpdateUserPayload {
-  name?: string;
-  slug?: string;
-  status?: string;
-  limits?: LimitRule[];
-}
-
-export interface UpdateSettingsPayload {
-  name?: string;
-  credit_weights?: CreditWeights;
-  admin_password?: string;
+export interface AdminEvent {
+  id: string;
+  user_id: string | null;
+  type: string;
+  detail: Record<string, unknown> | null;
+  subscription_id: string | null;
+  session_id: string | null;
+  created_at: string;
 }
 
 export interface LoginResponse {
   token: string;
-  team: Team;
-}
-
-export interface CreateUserResponse {
   user: {
     id: string;
-    slug: string;
+    email: string;
     name: string;
-    status: string;
-    auth_token: string;
-    created_at: string;
+    role: UserRole;
+    tier_id: string | null;
   };
-  limits: LimitRule[];
-  install_code: string;
 }
 
-export type WSEventType =
-  | 'user_check'
-  | 'user_blocked'
-  | 'user_counted'
-  | 'user_status_change'
-  | 'user_killed'
-  | 'user_status'
-  | 'ws_connected'
-  | 'ws_disconnected';
-
-export interface WSEvent {
-  type: WSEventType;
-  userId?: string;
-  userName?: string;
-  model?: string;
-  reason?: string;
-  creditCost?: number;
-  oldStatus?: string;
-  newStatus?: string;
-  projectDir?: string;
-  hostname?: string;
-  sessionId?: string;
-  timestamp: string;
-}
-
-export interface FeedItem {
-  id: string;
-  type: 'check' | 'blocked' | 'counted' | 'status' | 'system';
-  user: string;
-  detail: string;
-  time: string;
+export interface AuthStartResponse {
+  ticket: string;
+  ws_url: string;
+  expires_in: number;
 }
