@@ -1,87 +1,49 @@
 'use strict';
 
 const db = require('../db');
+const { computeCreditCost, evaluateBalance } = require('./limiter');
 
 /**
- * Record a usage event (one completed turn).
- * @param {string} userId
- * @param {string} model - opus | sonnet | haiku | default
- * @param {number} creditCost - cost from credit_weights
- * @param {string} [timestamp] - ISO string, defaults to now
- * @param {string} [source] - 'hook' | 'server', defaults to 'hook'
+ * Record one completed turn.
+ * Computes credit_cost from token counts using the user's tier weights at insert time
+ * and freezes the weights snapshot in the row so retroactive weight changes don't rewrite history.
+ *
+ * Caller must have already checked balance via evaluateBalance() pre-flight.
  */
-function recordEvent(userId, model, creditCost, timestamp, source) {
-  return db.recordUsage({
-    userId,
+async function recordTurn({ user, subscriptionId, sessionId, model, tokens }) {
+  const tier = user.tier_id ? await db.getTier(user.tier_id) : null;
+  const weights = tier ? tier.credit_weights : {};
+
+  const creditCost = computeCreditCost({ model, ...tokens }, weights);
+
+  await db.recordUsage({
+    userId: user.id,
+    subscriptionId,
+    sessionId,
     model,
+    inputTokens: tokens.inputTokens,
+    outputTokens: tokens.outputTokens,
+    cacheReadTokens: tokens.cacheReadTokens,
+    cacheCreateTokens: tokens.cacheCreateTokens,
     creditCost,
-    timestamp: timestamp || new Date().toISOString(),
-    source: source || 'hook',
+    weightsSnapshot: weights,
   });
+
+  return { creditCost };
 }
 
 /**
- * Get usage counts by model for a user within a window.
- * @param {string} userId
- * @param {string} windowType - daily | weekly | monthly | sliding_24h
- * @param {string} [tz] - IANA timezone
- * @returns {{ opus: number, sonnet: number, haiku: number, default: number }}
+ * User-facing summary: balance + window + recent usage.
  */
-function getUsageByWindow(userId, windowType, tz) {
-  const windowStart = db.calculateWindowStart(windowType, tz);
-  return db.getUsage(userId, windowStart);
-}
-
-/**
- * Get a full usage summary for a user across all windows.
- * @param {string} userId
- * @param {string} [tz] - IANA timezone
- * @returns {{ daily: object, weekly: object, monthly: object, sliding_24h: object }}
- */
-function getUsageSummary(userId, tz) {
-  const windows = ['daily', 'weekly', 'monthly', 'sliding_24h'];
-  const summary = {};
-  for (const w of windows) {
-    const data = db.getUsageForWindow(userId, w, tz);
-    summary[w] = {
-      counts: data.counts,
-      totalCredits: data.totalCredits,
-      windowStart: data.windowStart,
-    };
-  }
-  return summary;
-}
-
-/**
- * Get remaining credit balance for a user.
- * @param {string} userId
- * @param {object} creditWeights - { opus: 10, sonnet: 3, haiku: 1 }
- * @param {string} windowType - daily | weekly | monthly | sliding_24h
- * @param {number} budget - total credit budget
- * @param {string} [tz] - IANA timezone
- * @returns {{ balance: number, used: number, budget: number }}
- */
-function getCreditBalance(userId, creditWeights, windowType, budget, tz) {
-  const windowStart = db.calculateWindowStart(windowType, tz);
-  const data = db.getUsageWithCredits(userId, windowStart);
-  const used = data.totalCredits;
-  const balance = Math.max(0, budget - used);
-  return { balance, used, budget };
-}
-
-/**
- * Delete usage events older than N days.
- * @param {number} days
- * @returns {{ changes: number }}
- */
-function cleanupOldEvents(days) {
-  return db.cleanupOldEvents(days || 90);
+async function summaryForUser(userId) {
+  const user = await db.getUser(userId);
+  if (!user) return null;
+  const balance = await evaluateBalance(user);
+  const recent = await db.recentEvents({ userId, limit: 25 });
+  return { balance, recent };
 }
 
 module.exports = {
-  recordEvent,
-  getUsageByWindow,
-  getUsageSummary,
-  getCreditBalance,
-  cleanupOldEvents,
+  recordTurn,
+  summaryForUser,
 };

@@ -1,777 +1,628 @@
 'use strict';
 
-const path = require('path');
-const fs = require('fs');
-const Database = require('better-sqlite3');
+const { Pool } = require('pg');
 const { v4: uuidv4 } = require('uuid');
 const bcrypt = require('bcryptjs');
 
-let db = null;
+let pool = null;
 
-/**
- * Initialize the database: open/create, set up tables, indexes.
- * @param {string} [dbPath] - Optional path to the SQLite file.
- */
-function init(dbPath) {
-  if (db) return db;
+function getPool() {
+  if (!pool) throw new Error('Database not initialized. Call init() first.');
+  return pool;
+}
 
-  if (!dbPath) {
-    const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, '..', '..', 'data');
-    dbPath = path.join(DATA_DIR, 'limiter.db');
+async function query(text, params) {
+  return getPool().query(text, params);
+}
+
+async function init() {
+  if (pool) return pool;
+
+  const connectionString = process.env.DATABASE_URL;
+  if (!connectionString) {
+    throw new Error('DATABASE_URL is required');
   }
 
-  const dataDir = path.dirname(dbPath);
-  if (!fs.existsSync(dataDir)) {
-    fs.mkdirSync(dataDir, { recursive: true });
-  }
+  pool = new Pool({ connectionString });
 
-  db = new Database(dbPath);
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = ON');
+  // Verify connectivity up front so a misconfigured DSN fails fast at boot.
+  await pool.query('SELECT 1');
 
-  // Create tables
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS team (
+  await runMigrations();
+  console.log(`[db] Postgres connected and migrations applied`);
+  return pool;
+}
+
+async function runMigrations() {
+  await query(`
+    CREATE TABLE IF NOT EXISTS tier (
       id              TEXT PRIMARY KEY,
-      name            TEXT NOT NULL,
-      admin_password  TEXT NOT NULL,
-      credit_weights  TEXT NOT NULL DEFAULT '{"opus":10,"sonnet":3,"haiku":1}',
-      created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
+      name            TEXT NOT NULL UNIQUE,
+      credit_budget   BIGINT NOT NULL,
+      window_type     TEXT NOT NULL,
+      allowed_pools   JSONB NOT NULL DEFAULT '[]'::jsonb,
+      failover_pools  JSONB NOT NULL DEFAULT '[]'::jsonb,
+      credit_weights  JSONB NOT NULL,
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
-    CREATE TABLE IF NOT EXISTS user (
+    CREATE TABLE IF NOT EXISTS app_user (
+      id                TEXT PRIMARY KEY,
+      email             TEXT NOT NULL UNIQUE,
+      name              TEXT NOT NULL,
+      password_hash     TEXT,
+      external_subject  TEXT,
+      tier_id           TEXT REFERENCES tier(id) ON DELETE SET NULL,
+      role              TEXT NOT NULL DEFAULT 'member',
+      status            TEXT NOT NULL DEFAULT 'active',
+      last_seen         TIMESTAMPTZ,
+      created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS pool (
       id          TEXT PRIMARY KEY,
-      team_id     TEXT NOT NULL REFERENCES team(id),
-      slug        TEXT NOT NULL,
-      name        TEXT NOT NULL,
-      auth_token  TEXT NOT NULL UNIQUE,
-      status      TEXT NOT NULL DEFAULT 'active',
-      killed_at   DATETIME,
-      last_seen   DATETIME,
-      created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE(team_id, slug)
+      name        TEXT NOT NULL UNIQUE,
+      plan        TEXT NOT NULL,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
-    CREATE TABLE IF NOT EXISTS limit_rule (
+    CREATE TABLE IF NOT EXISTS subscription (
       id              TEXT PRIMARY KEY,
-      user_id         TEXT NOT NULL REFERENCES user(id) ON DELETE CASCADE,
-      type            TEXT NOT NULL,
-      model           TEXT,
-      window          TEXT,
-      value           INTEGER,
-      schedule_start  TEXT,
-      schedule_end    TEXT,
-      schedule_tz     TEXT,
-      created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
+      pool_id         TEXT NOT NULL REFERENCES pool(id) ON DELETE CASCADE,
+      pod_name        TEXT NOT NULL UNIQUE,
+      pod_endpoint    TEXT NOT NULL,
+      login_email     TEXT NOT NULL,
+      status          TEXT NOT NULL DEFAULT 'pending_auth',
+      cool_down_until TIMESTAMPTZ,
+      last_health     TIMESTAMPTZ,
+      notes           TEXT,
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS project (
+      id              TEXT PRIMARY KEY,
+      user_id         TEXT NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+      name            TEXT NOT NULL,
+      workspace_path  TEXT NOT NULL,
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE(user_id, name)
+    );
+
+    CREATE TABLE IF NOT EXISTS session (
+      id              TEXT PRIMARY KEY,
+      user_id         TEXT NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+      project_id      TEXT NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+      subscription_id TEXT REFERENCES subscription(id) ON DELETE SET NULL,
+      pinned_until    TIMESTAMPTZ,
+      status          TEXT NOT NULL DEFAULT 'active',
+      started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      ended_at        TIMESTAMPTZ
+    );
+
+    CREATE TABLE IF NOT EXISTS message (
+      id          TEXT PRIMARY KEY,
+      session_id  TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
+      role        TEXT NOT NULL,
+      content     TEXT NOT NULL,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
     CREATE TABLE IF NOT EXISTS usage_event (
-      id          INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id     TEXT NOT NULL REFERENCES user(id) ON DELETE CASCADE,
-      model       TEXT NOT NULL,
-      credit_cost INTEGER NOT NULL,
-      timestamp   DATETIME NOT NULL,
-      source      TEXT NOT NULL DEFAULT 'hook'
+      id                  BIGSERIAL PRIMARY KEY,
+      user_id             TEXT NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+      subscription_id     TEXT REFERENCES subscription(id) ON DELETE SET NULL,
+      session_id          TEXT REFERENCES session(id) ON DELETE SET NULL,
+      model               TEXT NOT NULL,
+      input_tokens        BIGINT NOT NULL DEFAULT 0,
+      output_tokens       BIGINT NOT NULL DEFAULT 0,
+      cache_read_tokens   BIGINT NOT NULL DEFAULT 0,
+      cache_create_tokens BIGINT NOT NULL DEFAULT 0,
+      credit_cost         BIGINT NOT NULL,
+      weights_snapshot    JSONB NOT NULL,
+      timestamp           TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
-    CREATE TABLE IF NOT EXISTS install_code (
-      code        TEXT PRIMARY KEY,
-      user_id     TEXT NOT NULL REFERENCES user(id) ON DELETE CASCADE,
-      used        BOOLEAN DEFAULT 0,
-      created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS device (
-      id              TEXT PRIMARY KEY,
-      user_id         TEXT NOT NULL REFERENCES user(id) ON DELETE CASCADE,
-      hostname        TEXT,
-      platform        TEXT,
-      arch            TEXT,
-      os_version      TEXT,
-      node_version    TEXT,
-      claude_version  TEXT,
-      subscription_type TEXT,
-      default_model   TEXT,
-      first_seen      DATETIME DEFAULT CURRENT_TIMESTAMP,
-      last_seen       DATETIME DEFAULT CURRENT_TIMESTAMP,
-      last_ip         TEXT,
-      UNIQUE(user_id, hostname)
+    CREATE TABLE IF NOT EXISTS credit_grant (
+      id          TEXT PRIMARY KEY,
+      user_id     TEXT NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+      amount      BIGINT NOT NULL,
+      reason      TEXT,
+      granted_by  TEXT REFERENCES app_user(id) ON DELETE SET NULL,
+      granted_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at  TIMESTAMPTZ NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS session_event (
-      id              INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id         TEXT NOT NULL REFERENCES user(id) ON DELETE CASCADE,
-      device_id       TEXT REFERENCES device(id),
+      id              BIGSERIAL PRIMARY KEY,
+      user_id         TEXT NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+      session_id      TEXT REFERENCES session(id) ON DELETE SET NULL,
       type            TEXT NOT NULL,
-      model           TEXT,
-      prompt_length   INTEGER,
-      project_dir     TEXT,
-      tools_used      INTEGER,
-      session_id      TEXT,
-      blocked_reason  TEXT,
-      response_length INTEGER,
-      timestamp       DATETIME NOT NULL
+      subscription_id TEXT REFERENCES subscription(id) ON DELETE SET NULL,
+      detail          JSONB,
+      timestamp       TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
 
-    CREATE INDEX IF NOT EXISTS idx_session_event_user_ts ON session_event(user_id, timestamp);
-    CREATE INDEX IF NOT EXISTS idx_session_event_type ON session_event(user_id, type, timestamp);
-
     CREATE INDEX IF NOT EXISTS idx_usage_user_ts ON usage_event(user_id, timestamp);
-    CREATE INDEX IF NOT EXISTS idx_usage_model_ts ON usage_event(user_id, model, timestamp);
-    CREATE INDEX IF NOT EXISTS idx_user_auth_token ON user(auth_token);
-    CREATE INDEX IF NOT EXISTS idx_user_team ON user(team_id);
-    CREATE INDEX IF NOT EXISTS idx_limit_rule_user ON limit_rule(user_id);
-    CREATE INDEX IF NOT EXISTS idx_install_code_user ON install_code(user_id);
-    CREATE INDEX IF NOT EXISTS idx_device_user ON device(user_id);
+    CREATE INDEX IF NOT EXISTS idx_usage_sub_ts ON usage_event(subscription_id, timestamp);
+    CREATE INDEX IF NOT EXISTS idx_session_event_user_ts ON session_event(user_id, timestamp);
+    CREATE INDEX IF NOT EXISTS idx_credit_grant_user ON credit_grant(user_id, expires_at);
+    CREATE INDEX IF NOT EXISTS idx_app_user_email ON app_user(email);
   `);
-
-  console.log(`Database initialized at ${dbPath}`);
-  return db;
 }
 
-/**
- * Seed a default team if none exists.
- * @param {string} [adminPassword] - Plain-text admin password.
- */
-function seed(adminPassword) {
-  const conn = getDb();
-  const row = conn.prepare('SELECT COUNT(*) AS count FROM team').get();
-  if (row.count > 0) return;
-
-  const password = adminPassword || process.env.ADMIN_PASSWORD || 'changeme';
-  const hash = bcrypt.hashSync(password, 10);
-  const teamId = uuidv4();
-
-  conn.prepare(
-    'INSERT INTO team (id, name, admin_password, credit_weights) VALUES (?, ?, ?, ?)'
-  ).run(teamId, 'Default Team', hash, JSON.stringify({ opus: 10, sonnet: 3, haiku: 1 }));
-
-  console.log(`Default team created (id: ${teamId})`);
-  if (password === 'changeme') {
-    console.warn('WARNING: Using default admin password "changeme". Set ADMIN_PASSWORD env var for production.');
+async function close() {
+  if (pool) {
+    await pool.end();
+    pool = null;
   }
 }
 
-/**
- * Get the raw database instance.
- */
-function getDb() {
-  if (!db) throw new Error('Database not initialized. Call init() first.');
-  return db;
-}
+// ---------- Bootstrap ----------
 
-/**
- * Close the database connection.
- */
-function close() {
-  if (db) {
-    db.close();
-    db = null;
+async function ensureBootstrapAdmin() {
+  const email = process.env.ADMIN_EMAIL;
+  const password = process.env.ADMIN_PASSWORD;
+  if (!email || !password) {
+    console.warn('[db] ADMIN_EMAIL/ADMIN_PASSWORD not set; skipping admin bootstrap');
+    return null;
   }
-}
 
-// --------------- Team helpers ---------------
+  const existing = await getUserByEmail(email);
+  if (existing) {
+    return existing;
+  }
 
-function getTeam(teamId) {
-  return getDb().prepare('SELECT * FROM team WHERE id = ?').get(teamId);
-}
-
-function getDefaultTeam() {
-  return getDb().prepare('SELECT * FROM team ORDER BY created_at ASC LIMIT 1').get();
-}
-
-function updateTeam(teamId, fields) {
-  const sets = [];
-  const values = [];
-  if (fields.name !== undefined) { sets.push('name = ?'); values.push(fields.name); }
-  if (fields.credit_weights !== undefined) { sets.push('credit_weights = ?'); values.push(typeof fields.credit_weights === 'string' ? fields.credit_weights : JSON.stringify(fields.credit_weights)); }
-  if (fields.admin_password !== undefined) { sets.push('admin_password = ?'); values.push(fields.admin_password); }
-  if (sets.length === 0) return;
-  values.push(teamId);
-  getDb().prepare(`UPDATE team SET ${sets.join(', ')} WHERE id = ?`).run(...values);
-}
-
-// --------------- User helpers ---------------
-
-function getUser(userId) {
-  return getDb().prepare('SELECT * FROM user WHERE id = ?').get(userId);
-}
-
-function getUserByToken(authToken) {
-  return getDb().prepare('SELECT * FROM user WHERE auth_token = ?').get(authToken);
-}
-
-function getUserBySlug(teamId, slug) {
-  return getDb().prepare('SELECT * FROM user WHERE team_id = ? AND slug = ?').get(teamId, slug);
-}
-
-function getAllUsers(teamId) {
-  return getDb().prepare('SELECT * FROM user WHERE team_id = ? ORDER BY created_at ASC').all(teamId);
-}
-
-function createUser({ teamId, slug, name }) {
   const id = uuidv4();
-  const authToken = uuidv4();
-  getDb().prepare(
-    'INSERT INTO user (id, team_id, slug, name, auth_token) VALUES (?, ?, ?, ?, ?)'
-  ).run(id, teamId, slug, name, authToken);
+  const hash = bcrypt.hashSync(password, 10);
+  await query(
+    `INSERT INTO app_user (id, email, name, password_hash, role, status)
+     VALUES ($1, $2, $3, $4, 'admin', 'active')`,
+    [id, email, email.split('@')[0], hash]
+  );
+  console.log(`[db] Bootstrapped admin user ${email}`);
   return getUser(id);
 }
 
-function updateUser(userId, fields) {
+// ---------- Users ----------
+
+async function getUser(id) {
+  const { rows } = await query('SELECT * FROM app_user WHERE id = $1', [id]);
+  return rows[0] || null;
+}
+
+async function getUserByEmail(email) {
+  const { rows } = await query('SELECT * FROM app_user WHERE email = $1', [email]);
+  return rows[0] || null;
+}
+
+async function listUsers() {
+  const { rows } = await query('SELECT * FROM app_user ORDER BY created_at ASC');
+  return rows;
+}
+
+async function createUser({ email, name, passwordHash, tierId, role }) {
+  const id = uuidv4();
+  await query(
+    `INSERT INTO app_user (id, email, name, password_hash, tier_id, role)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [id, email, name, passwordHash || null, tierId || null, role || 'member']
+  );
+  return getUser(id);
+}
+
+async function updateUser(id, fields) {
   const sets = [];
   const values = [];
-  if (fields.name !== undefined) { sets.push('name = ?'); values.push(fields.name); }
-  if (fields.slug !== undefined) { sets.push('slug = ?'); values.push(fields.slug); }
-  if (fields.status !== undefined) {
-    sets.push('status = ?');
-    values.push(fields.status);
-    if (fields.status === 'killed') {
-      sets.push('killed_at = ?');
-      values.push(new Date().toISOString());
-    } else if (fields.status === 'active') {
-      sets.push('killed_at = NULL');
-    }
-  }
-  if (fields.last_seen !== undefined) { sets.push('last_seen = ?'); values.push(fields.last_seen); }
-  if (sets.length === 0) return;
-  values.push(userId);
-  getDb().prepare(`UPDATE user SET ${sets.join(', ')} WHERE id = ?`).run(...values);
+  let i = 1;
+  if (fields.name !== undefined) { sets.push(`name = $${i++}`); values.push(fields.name); }
+  if (fields.tier_id !== undefined) { sets.push(`tier_id = $${i++}`); values.push(fields.tier_id); }
+  if (fields.role !== undefined) { sets.push(`role = $${i++}`); values.push(fields.role); }
+  if (fields.status !== undefined) { sets.push(`status = $${i++}`); values.push(fields.status); }
+  if (fields.password_hash !== undefined) { sets.push(`password_hash = $${i++}`); values.push(fields.password_hash); }
+  if (fields.last_seen !== undefined) { sets.push(`last_seen = $${i++}`); values.push(fields.last_seen); }
+  if (sets.length === 0) return getUser(id);
+  values.push(id);
+  await query(`UPDATE app_user SET ${sets.join(', ')} WHERE id = $${i}`, values);
+  return getUser(id);
 }
 
-function deleteUser(userId) {
-  // Foreign keys with ON DELETE CASCADE handle related rows
-  getDb().prepare('DELETE FROM user WHERE id = ?').run(userId);
+async function deleteUser(id) {
+  await query('DELETE FROM app_user WHERE id = $1', [id]);
 }
 
-// --------------- Limit Rule helpers ---------------
+// ---------- Tiers ----------
 
-function getLimitRules(userId) {
-  return getDb().prepare('SELECT * FROM limit_rule WHERE user_id = ? ORDER BY created_at ASC').all(userId);
+async function listTiers() {
+  const { rows } = await query('SELECT * FROM tier ORDER BY name ASC');
+  return rows;
 }
 
-function createLimitRule({ userId, type, model, window, value, schedule_start, schedule_end, schedule_tz }) {
+async function getTier(id) {
+  const { rows } = await query('SELECT * FROM tier WHERE id = $1', [id]);
+  return rows[0] || null;
+}
+
+async function createTier({ name, creditBudget, windowType, allowedPools, failoverPools, creditWeights }) {
   const id = uuidv4();
-  getDb().prepare(
-    'INSERT INTO limit_rule (id, user_id, type, model, window, value, schedule_start, schedule_end, schedule_tz) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
-  ).run(id, userId, type, model || null, window || null, value != null ? value : null, schedule_start || null, schedule_end || null, schedule_tz || null);
-  return getDb().prepare('SELECT * FROM limit_rule WHERE id = ?').get(id);
+  await query(
+    `INSERT INTO tier (id, name, credit_budget, window_type, allowed_pools, failover_pools, credit_weights)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    [
+      id,
+      name,
+      creditBudget,
+      windowType,
+      JSON.stringify(allowedPools || []),
+      JSON.stringify(failoverPools || []),
+      JSON.stringify(creditWeights),
+    ]
+  );
+  return getTier(id);
 }
 
-function deleteLimitRule(ruleId) {
-  getDb().prepare('DELETE FROM limit_rule WHERE id = ?').run(ruleId);
+async function updateTier(id, fields) {
+  const sets = [];
+  const values = [];
+  let i = 1;
+  if (fields.name !== undefined) { sets.push(`name = $${i++}`); values.push(fields.name); }
+  if (fields.credit_budget !== undefined) { sets.push(`credit_budget = $${i++}`); values.push(fields.credit_budget); }
+  if (fields.window_type !== undefined) { sets.push(`window_type = $${i++}`); values.push(fields.window_type); }
+  if (fields.allowed_pools !== undefined) { sets.push(`allowed_pools = $${i++}`); values.push(JSON.stringify(fields.allowed_pools)); }
+  if (fields.failover_pools !== undefined) { sets.push(`failover_pools = $${i++}`); values.push(JSON.stringify(fields.failover_pools)); }
+  if (fields.credit_weights !== undefined) { sets.push(`credit_weights = $${i++}`); values.push(JSON.stringify(fields.credit_weights)); }
+  if (sets.length === 0) return getTier(id);
+  values.push(id);
+  await query(`UPDATE tier SET ${sets.join(', ')} WHERE id = $${i}`, values);
+  return getTier(id);
 }
 
-function deleteLimitRulesForUser(userId) {
-  getDb().prepare('DELETE FROM limit_rule WHERE user_id = ?').run(userId);
+async function deleteTier(id) {
+  await query('DELETE FROM tier WHERE id = $1', [id]);
 }
 
-// --------------- Usage Event helpers ---------------
+// ---------- Pools ----------
 
-function recordUsage({ userId, model, creditCost, timestamp, source }) {
-  const ts = timestamp || new Date().toISOString();
-  const src = source || 'hook';
-  return getDb().prepare(
-    'INSERT INTO usage_event (user_id, model, credit_cost, timestamp, source) VALUES (?, ?, ?, ?, ?)'
-  ).run(userId, model, creditCost, ts, src);
+async function listPools() {
+  const { rows } = await query('SELECT * FROM pool ORDER BY name ASC');
+  return rows;
 }
 
-/**
- * Get usage event count by model for a user since a given timestamp.
- * Returns { opus: N, sonnet: N, haiku: N, default: N }
- */
-function getUsage(userId, since) {
-  const rows = getDb().prepare(
-    'SELECT model, COUNT(*) AS count FROM usage_event WHERE user_id = ? AND timestamp >= ? GROUP BY model'
-  ).all(userId, since);
-
-  const result = { opus: 0, sonnet: 0, haiku: 0, default: 0 };
-  for (const row of rows) {
-    result[row.model] = row.count;
-  }
-  return result;
+async function getPoolById(id) {
+  const { rows } = await query('SELECT * FROM pool WHERE id = $1', [id]);
+  return rows[0] || null;
 }
 
-/**
- * Get usage with credit sums for a user since a given timestamp.
- */
-function getUsageWithCredits(userId, since) {
-  const rows = getDb().prepare(
-    'SELECT model, COUNT(*) AS count, SUM(credit_cost) AS total_credits FROM usage_event WHERE user_id = ? AND timestamp >= ? GROUP BY model'
-  ).all(userId, since);
-
-  const counts = { opus: 0, sonnet: 0, haiku: 0, default: 0 };
-  let totalCredits = 0;
-  for (const row of rows) {
-    counts[row.model] = row.count;
-    totalCredits += row.total_credits;
-  }
-  return { counts, totalCredits };
+async function createPoolRow({ name, plan }) {
+  const id = uuidv4();
+  await query('INSERT INTO pool (id, name, plan) VALUES ($1, $2, $3)', [id, name, plan]);
+  return getPoolById(id);
 }
 
-/**
- * Get usage for a specific window type.
- * @param {string} userId
- * @param {string} windowType - daily | weekly | monthly | sliding_24h
- * @param {string} [tz] - IANA timezone (default UTC)
- * @returns {{ counts: object, totalCredits: number, windowStart: string }}
- */
-function getUsageForWindow(userId, windowType, tz) {
-  const windowStart = calculateWindowStart(windowType, tz);
-  const data = getUsageWithCredits(userId, windowStart);
-  return { ...data, windowStart };
+async function deletePool(id) {
+  await query('DELETE FROM pool WHERE id = $1', [id]);
 }
 
-/**
- * Calculate the start of a window in ISO string.
- */
-function calculateWindowStart(windowType, tz) {
-  const now = new Date();
+// ---------- Subscriptions ----------
 
-  if (windowType === 'sliding_24h') {
-    return new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
-  }
-
-  // For daily/weekly/monthly we compute midnight in the given timezone
-  // then convert back to UTC ISO string for the DB query.
-  const timeZone = tz || 'UTC';
-
-  // Get current date parts in the target timezone
-  const parts = getDatePartsInTZ(now, timeZone);
-
-  let year = parts.year;
-  let month = parts.month; // 1-based
-  let day = parts.day;
-
-  if (windowType === 'daily') {
-    // midnight today in the timezone
-  } else if (windowType === 'weekly') {
-    // Monday of this week
-    const dayOfWeek = parts.dayOfWeek; // 0=Sun, 1=Mon, ...
-    const daysToSubtract = dayOfWeek === 0 ? 6 : dayOfWeek - 1;
-    const dt = new Date(year, month - 1, day - daysToSubtract);
-    year = dt.getFullYear();
-    month = dt.getMonth() + 1;
-    day = dt.getDate();
-  } else if (windowType === 'monthly') {
-    day = 1;
-  }
-
-  // Build a date string in the target timezone and convert to UTC
-  // Create the local midnight in the target timezone
-  const localMidnight = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}T00:00:00`;
-
-  // Use a trick: compute the UTC offset for this date in this timezone
-  const utcDate = localDateToUTC(localMidnight, timeZone);
-  return utcDate.toISOString();
+async function listSubscriptions() {
+  const { rows } = await query(
+    `SELECT s.*, p.name AS pool_name, p.plan AS pool_plan
+     FROM subscription s
+     JOIN pool p ON s.pool_id = p.id
+     ORDER BY s.created_at ASC`
+  );
+  return rows;
 }
 
-/**
- * Get date components in a given timezone.
- */
-function getDatePartsInTZ(date, timeZone) {
-  const formatter = new Intl.DateTimeFormat('en-US', {
-    timeZone,
-    year: 'numeric',
-    month: 'numeric',
-    day: 'numeric',
-    weekday: 'short',
-    hour: 'numeric',
-    minute: 'numeric',
-    hour12: false,
-  });
-  const parts = formatter.formatToParts(date);
-  const map = {};
-  for (const p of parts) {
-    map[p.type] = p.value;
-  }
-  const dayOfWeekMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
-  return {
-    year: parseInt(map.year, 10),
-    month: parseInt(map.month, 10),
-    day: parseInt(map.day, 10),
-    hour: parseInt(map.hour, 10),
-    minute: parseInt(map.minute, 10),
-    dayOfWeek: dayOfWeekMap[map.weekday] ?? 0,
-  };
+async function getSubscription(id) {
+  const { rows } = await query('SELECT * FROM subscription WHERE id = $1', [id]);
+  return rows[0] || null;
 }
 
-/**
- * Convert a local date string (without TZ info) in a given timezone to a UTC Date object.
- */
-function localDateToUTC(localDateStr, timeZone) {
-  // Parse the local date string
-  const [datePart, timePart] = localDateStr.split('T');
-  const [year, month, day] = datePart.split('-').map(Number);
-  const [hour, minute, second] = (timePart || '00:00:00').split(':').map(Number);
-
-  // Create a date in UTC first, then figure out the offset for this timezone
-  const utcGuess = new Date(Date.UTC(year, month - 1, day, hour, minute, second || 0));
-
-  // Get what the local time would be at this UTC time in the target timezone
-  const inTZ = getDatePartsInTZ(utcGuess, timeZone);
-
-  // The offset in minutes: inTZ time - utcGuess time
-  const utcMinutes = utcGuess.getUTCHours() * 60 + utcGuess.getUTCMinutes();
-  const tzMinutes = inTZ.hour * 60 + inTZ.minute;
-
-  // Day difference handling
-  let offsetMinutes = tzMinutes - utcMinutes;
-
-  // Handle day boundary: if the tz date differs from UTC date, adjust
-  const utcDay = utcGuess.getUTCDate();
-  if (inTZ.day > utcDay) {
-    offsetMinutes += 24 * 60;
-  } else if (inTZ.day < utcDay) {
-    offsetMinutes -= 24 * 60;
-  }
-
-  // The actual UTC time = local time - offset
-  return new Date(utcGuess.getTime() - offsetMinutes * 60 * 1000);
+async function createSubscription({ poolId, podName, podEndpoint, loginEmail, notes }) {
+  const id = uuidv4();
+  await query(
+    `INSERT INTO subscription (id, pool_id, pod_name, pod_endpoint, login_email, notes)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [id, poolId, podName, podEndpoint, loginEmail, notes || null]
+  );
+  return getSubscription(id);
 }
 
-/**
- * Get recent events for a user or all users.
- */
-function getRecentEvents({ userId, limit, teamId }) {
-  const lim = limit || 50;
-  if (userId) {
-    return getDb().prepare(
-      'SELECT e.*, u.name AS user_name, u.slug AS user_slug FROM usage_event e JOIN user u ON e.user_id = u.id WHERE e.user_id = ? ORDER BY e.timestamp DESC LIMIT ?'
-    ).all(userId, lim);
-  }
-  if (teamId) {
-    return getDb().prepare(
-      'SELECT e.*, u.name AS user_name, u.slug AS user_slug FROM usage_event e JOIN user u ON e.user_id = u.id WHERE u.team_id = ? ORDER BY e.timestamp DESC LIMIT ?'
-    ).all(teamId, lim);
-  }
-  return getDb().prepare(
-    'SELECT e.*, u.name AS user_name, u.slug AS user_slug FROM usage_event e JOIN user u ON e.user_id = u.id ORDER BY e.timestamp DESC LIMIT ?'
-  ).all(lim);
+async function updateSubscription(id, fields) {
+  const sets = [];
+  const values = [];
+  let i = 1;
+  if (fields.status !== undefined) { sets.push(`status = $${i++}`); values.push(fields.status); }
+  if (fields.cool_down_until !== undefined) { sets.push(`cool_down_until = $${i++}`); values.push(fields.cool_down_until); }
+  if (fields.last_health !== undefined) { sets.push(`last_health = $${i++}`); values.push(fields.last_health); }
+  if (fields.notes !== undefined) { sets.push(`notes = $${i++}`); values.push(fields.notes); }
+  if (fields.pod_endpoint !== undefined) { sets.push(`pod_endpoint = $${i++}`); values.push(fields.pod_endpoint); }
+  if (sets.length === 0) return getSubscription(id);
+  values.push(id);
+  await query(`UPDATE subscription SET ${sets.join(', ')} WHERE id = $${i}`, values);
+  return getSubscription(id);
 }
 
-/**
- * Delete events older than N days.
- */
-function cleanupOldEvents(days) {
-  const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-  return getDb().prepare('DELETE FROM usage_event WHERE timestamp < ?').run(cutoff);
+async function deleteSubscription(id) {
+  await query('DELETE FROM subscription WHERE id = $1', [id]);
 }
 
-// --------------- Install Code helpers ---------------
+// ---------- Projects / Sessions / Messages ----------
 
-function createInstallCode(userId) {
-  // Generate a human-readable code: CLM-<slug-prefix>-<random>
-  const user = getUser(userId);
-  const prefix = user ? user.slug.substring(0, 8) : 'user';
-  const random = uuidv4().substring(0, 6);
-  const code = `CLM-${prefix}-${random}`;
-
-  getDb().prepare(
-    'INSERT INTO install_code (code, user_id) VALUES (?, ?)'
-  ).run(code, userId);
-
-  return code;
+async function listProjects(userId) {
+  const { rows } = await query(
+    'SELECT * FROM project WHERE user_id = $1 ORDER BY created_at DESC',
+    [userId]
+  );
+  return rows;
 }
 
-function useInstallCode(code) {
-  const row = getDb().prepare('SELECT * FROM install_code WHERE code = ? AND used = 0').get(code);
-  if (!row) return null;
-
-  getDb().prepare('UPDATE install_code SET used = 1 WHERE code = ?').run(code);
-  return row;
+async function getProject(id) {
+  const { rows } = await query('SELECT * FROM project WHERE id = $1', [id]);
+  return rows[0] || null;
 }
 
-// --------------- Device helpers ---------------
+async function createProject({ userId, name, workspacePath }) {
+  const id = uuidv4();
+  await query(
+    `INSERT INTO project (id, user_id, name, workspace_path)
+     VALUES ($1, $2, $3, $4)`,
+    [id, userId, name, workspacePath]
+  );
+  return getProject(id);
+}
 
-/**
- * Upsert a device record for a user.
- * @param {string} userId
- * @param {object} deviceInfo - { hostname, platform, arch, os_version, node_version, claude_version, subscription_type, default_model, ip }
- * @returns {object} the device row
- */
-function upsertDevice(userId, deviceInfo) {
-  const hostname = deviceInfo.hostname || 'unknown';
-  const existing = getDb().prepare(
-    'SELECT * FROM device WHERE user_id = ? AND hostname = ?'
-  ).get(userId, hostname);
+async function deleteProject(id) {
+  await query('DELETE FROM project WHERE id = $1', [id]);
+}
 
-  if (existing) {
-    const sets = ['last_seen = ?'];
-    const values = [new Date().toISOString()];
-    if (deviceInfo.platform) { sets.push('platform = ?'); values.push(deviceInfo.platform); }
-    if (deviceInfo.arch) { sets.push('arch = ?'); values.push(deviceInfo.arch); }
-    if (deviceInfo.os_version) { sets.push('os_version = ?'); values.push(deviceInfo.os_version); }
-    if (deviceInfo.node_version) { sets.push('node_version = ?'); values.push(deviceInfo.node_version); }
-    if (deviceInfo.claude_version) { sets.push('claude_version = ?'); values.push(deviceInfo.claude_version); }
-    if (deviceInfo.subscription_type) { sets.push('subscription_type = ?'); values.push(deviceInfo.subscription_type); }
-    if (deviceInfo.default_model) { sets.push('default_model = ?'); values.push(deviceInfo.default_model); }
-    if (deviceInfo.ip) { sets.push('last_ip = ?'); values.push(deviceInfo.ip); }
-    values.push(existing.id);
-    getDb().prepare(`UPDATE device SET ${sets.join(', ')} WHERE id = ?`).run(...values);
-    return getDb().prepare('SELECT * FROM device WHERE id = ?').get(existing.id);
-  } else {
-    const id = uuidv4();
-    getDb().prepare(
-      `INSERT INTO device (id, user_id, hostname, platform, arch, os_version, node_version, claude_version, subscription_type, default_model, last_ip)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(
-      id, userId, hostname,
-      deviceInfo.platform || null,
-      deviceInfo.arch || null,
-      deviceInfo.os_version || null,
-      deviceInfo.node_version || null,
-      deviceInfo.claude_version || null,
-      deviceInfo.subscription_type || null,
-      deviceInfo.default_model || null,
-      deviceInfo.ip || null
+async function listSessions({ userId, projectId }) {
+  if (projectId) {
+    const { rows } = await query(
+      'SELECT * FROM session WHERE user_id = $1 AND project_id = $2 ORDER BY started_at DESC',
+      [userId, projectId]
     );
-    return getDb().prepare('SELECT * FROM device WHERE id = ?').get(id);
+    return rows;
   }
+  const { rows } = await query(
+    'SELECT * FROM session WHERE user_id = $1 ORDER BY started_at DESC',
+    [userId]
+  );
+  return rows;
 }
 
-/**
- * Get all devices for a user.
- * @param {string} userId
- * @returns {Array}
- */
-function getDevices(userId) {
-  return getDb().prepare('SELECT * FROM device WHERE user_id = ? ORDER BY last_seen DESC').all(userId);
+async function getSession(id) {
+  const { rows } = await query('SELECT * FROM session WHERE id = $1', [id]);
+  return rows[0] || null;
 }
 
-/**
- * Get all devices for a team.
- * @param {string} teamId
- * @returns {Array}
- */
-function getDevicesByTeam(teamId) {
-  return getDb().prepare(
-    `SELECT d.*, u.name AS user_name, u.slug AS user_slug
-     FROM device d
-     JOIN user u ON d.user_id = u.id
-     WHERE u.team_id = ?
-     ORDER BY d.last_seen DESC`
-  ).all(teamId);
+async function createSessionRow({ userId, projectId, subscriptionId, pinnedUntil }) {
+  const id = uuidv4();
+  await query(
+    `INSERT INTO session (id, user_id, project_id, subscription_id, pinned_until)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [id, userId, projectId, subscriptionId || null, pinnedUntil || null]
+  );
+  return getSession(id);
 }
 
-// --------------- Session Event helpers ---------------
+async function updateSession(id, fields) {
+  const sets = [];
+  const values = [];
+  let i = 1;
+  if (fields.subscription_id !== undefined) { sets.push(`subscription_id = $${i++}`); values.push(fields.subscription_id); }
+  if (fields.pinned_until !== undefined) { sets.push(`pinned_until = $${i++}`); values.push(fields.pinned_until); }
+  if (fields.status !== undefined) { sets.push(`status = $${i++}`); values.push(fields.status); }
+  if (fields.ended_at !== undefined) { sets.push(`ended_at = $${i++}`); values.push(fields.ended_at); }
+  if (sets.length === 0) return getSession(id);
+  values.push(id);
+  await query(`UPDATE session SET ${sets.join(', ')} WHERE id = $${i}`, values);
+  return getSession(id);
+}
 
-/**
- * Record a session event.
- * @param {object} data - { user_id, device_id, type, model, prompt_length, project_dir, tools_used, session_id, blocked_reason, response_length, timestamp }
- */
-function recordSessionEvent(data) {
-  const ts = data.timestamp || new Date().toISOString();
-  return getDb().prepare(
-    `INSERT INTO session_event (user_id, device_id, type, model, prompt_length, project_dir, tools_used, session_id, blocked_reason, response_length, timestamp)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    data.user_id,
-    data.device_id || null,
-    data.type,
-    data.model || null,
-    data.prompt_length != null ? data.prompt_length : null,
-    data.project_dir || null,
-    data.tools_used != null ? data.tools_used : null,
-    data.session_id || null,
-    data.blocked_reason || null,
-    data.response_length != null ? data.response_length : null,
-    ts
+async function listMessages(sessionId) {
+  const { rows } = await query(
+    'SELECT * FROM message WHERE session_id = $1 ORDER BY created_at ASC',
+    [sessionId]
+  );
+  return rows;
+}
+
+async function appendMessage({ sessionId, role, content }) {
+  const id = uuidv4();
+  await query(
+    `INSERT INTO message (id, session_id, role, content) VALUES ($1, $2, $3, $4)`,
+    [id, sessionId, role, content]
+  );
+  return { id, session_id: sessionId, role, content };
+}
+
+// ---------- Usage events ----------
+
+async function recordUsage({ userId, subscriptionId, sessionId, model, inputTokens, outputTokens, cacheReadTokens, cacheCreateTokens, creditCost, weightsSnapshot }) {
+  await query(
+    `INSERT INTO usage_event
+       (user_id, subscription_id, session_id, model,
+        input_tokens, output_tokens, cache_read_tokens, cache_create_tokens,
+        credit_cost, weights_snapshot)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+    [
+      userId,
+      subscriptionId || null,
+      sessionId || null,
+      model,
+      inputTokens || 0,
+      outputTokens || 0,
+      cacheReadTokens || 0,
+      cacheCreateTokens || 0,
+      creditCost,
+      JSON.stringify(weightsSnapshot || {}),
+    ]
   );
 }
 
-/**
- * Get session events for a user with optional filters.
- * @param {string} userId
- * @param {object} [opts] - { since, type, limit }
- * @returns {Array}
- */
-function getSessionEvents(userId, opts) {
-  opts = opts || {};
-  const conditions = ['user_id = ?'];
-  const params = [userId];
-
-  if (opts.since) {
-    conditions.push('timestamp >= ?');
-    params.push(opts.since);
-  }
-  if (opts.type) {
-    conditions.push('type = ?');
-    params.push(opts.type);
-  }
-
-  const lim = opts.limit || 100;
-  params.push(lim);
-
-  return getDb().prepare(
-    `SELECT * FROM session_event WHERE ${conditions.join(' AND ')} ORDER BY timestamp DESC LIMIT ?`
-  ).all(...params);
+async function sumUsageInWindow(userId, since) {
+  const { rows } = await query(
+    `SELECT COALESCE(SUM(credit_cost), 0)::bigint AS total
+       FROM usage_event
+      WHERE user_id = $1 AND timestamp >= $2`,
+    [userId, since]
+  );
+  return Number(rows[0].total);
 }
 
-/**
- * Get analytics data for a team.
- * @param {string} teamId
- * @param {object} [opts] - { days, user_id }
- * @returns {object} Analytics data
- */
-function getAnalytics(teamId, opts) {
-  opts = opts || {};
-  const days = opts.days || 7;
-  const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-
-  const userFilter = opts.user_id ? ' AND se.user_id = ?' : '';
-  const userFilterParams = opts.user_id ? [opts.user_id] : [];
-
-  // Peak usage hours (group by hour of day, count events)
-  const peakHours = getDb().prepare(
-    `SELECT CAST(strftime('%H', se.timestamp) AS INTEGER) AS hour, COUNT(*) AS count
-     FROM session_event se
-     JOIN user u ON se.user_id = u.id
-     WHERE u.team_id = ? AND se.timestamp >= ? AND se.type = 'prompt'${userFilter}
-     GROUP BY hour
-     ORDER BY hour`
-  ).all(teamId, since, ...userFilterParams);
-
-  // Per-project usage
-  const projectUsage = getDb().prepare(
-    `SELECT se.project_dir AS project, COUNT(*) AS count
-     FROM session_event se
-     JOIN user u ON se.user_id = u.id
-     WHERE u.team_id = ? AND se.timestamp >= ? AND se.type = 'prompt' AND se.project_dir IS NOT NULL${userFilter}
-     GROUP BY se.project_dir
-     ORDER BY count DESC
-     LIMIT 20`
-  ).all(teamId, since, ...userFilterParams);
-
-  // Model distribution
-  const modelDistRows = getDb().prepare(
-    `SELECT se.model, COUNT(*) AS count
-     FROM session_event se
-     JOIN user u ON se.user_id = u.id
-     WHERE u.team_id = ? AND se.timestamp >= ? AND se.type = 'prompt' AND se.model IS NOT NULL${userFilter}
-     GROUP BY se.model`
-  ).all(teamId, since, ...userFilterParams);
-  const modelDistribution = {};
-  for (const row of modelDistRows) {
-    modelDistribution[row.model] = row.count;
+async function recentEvents({ userId, limit }) {
+  const lim = limit || 50;
+  if (userId) {
+    const { rows } = await query(
+      `SELECT e.*, u.name AS user_name, u.email AS user_email
+         FROM usage_event e
+         JOIN app_user u ON e.user_id = u.id
+        WHERE e.user_id = $1
+        ORDER BY e.timestamp DESC LIMIT $2`,
+      [userId, lim]
+    );
+    return rows;
   }
+  const { rows } = await query(
+    `SELECT e.*, u.name AS user_name, u.email AS user_email
+       FROM usage_event e
+       JOIN app_user u ON e.user_id = u.id
+      ORDER BY e.timestamp DESC LIMIT $1`,
+    [lim]
+  );
+  return rows;
+}
 
-  // Daily active users
-  const dailyActive = getDb().prepare(
-    `SELECT DATE(se.timestamp) AS date, COUNT(DISTINCT se.user_id) AS users
-     FROM session_event se
-     JOIN user u ON se.user_id = u.id
-     WHERE u.team_id = ? AND se.timestamp >= ?${userFilter}
-     GROUP BY DATE(se.timestamp)
-     ORDER BY date`
-  ).all(teamId, since, ...userFilterParams);
+// ---------- Credit grants ----------
 
-  // Block rate
-  const totalPrompts = getDb().prepare(
-    `SELECT COUNT(*) AS count FROM session_event se
-     JOIN user u ON se.user_id = u.id
-     WHERE u.team_id = ? AND se.timestamp >= ? AND se.type = 'prompt'${userFilter}`
-  ).get(teamId, since, ...userFilterParams);
+async function listGrants(userId) {
+  const { rows } = await query(
+    'SELECT * FROM credit_grant WHERE user_id = $1 ORDER BY granted_at DESC',
+    [userId]
+  );
+  return rows;
+}
 
-  const blockedCount = getDb().prepare(
-    `SELECT COUNT(*) AS count FROM session_event se
-     JOIN user u ON se.user_id = u.id
-     WHERE u.team_id = ? AND se.timestamp >= ? AND se.type = 'blocked'${userFilter}`
-  ).get(teamId, since, ...userFilterParams);
+async function sumActiveGrants(userId, asOf) {
+  const ts = asOf || new Date();
+  const { rows } = await query(
+    `SELECT COALESCE(SUM(amount), 0)::bigint AS total
+       FROM credit_grant
+      WHERE user_id = $1 AND expires_at > $2`,
+    [userId, ts]
+  );
+  return Number(rows[0].total);
+}
 
-  const total = totalPrompts.count;
-  const blocked = blockedCount.count;
-  const blockRate = { total, blocked, rate: total > 0 ? +(blocked / total).toFixed(4) : 0 };
+async function createGrant({ userId, amount, reason, grantedBy, expiresAt }) {
+  const id = uuidv4();
+  await query(
+    `INSERT INTO credit_grant (id, user_id, amount, reason, granted_by, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [id, userId, amount, reason || null, grantedBy || null, expiresAt]
+  );
+  const { rows } = await query('SELECT * FROM credit_grant WHERE id = $1', [id]);
+  return rows[0];
+}
 
-  // Average prompt length
-  const avgPromptRow = getDb().prepare(
-    `SELECT AVG(se.prompt_length) AS avg_len FROM session_event se
-     JOIN user u ON se.user_id = u.id
-     WHERE u.team_id = ? AND se.timestamp >= ? AND se.type = 'prompt' AND se.prompt_length IS NOT NULL${userFilter}`
-  ).get(teamId, since, ...userFilterParams);
-  const avgPromptLength = avgPromptRow.avg_len ? Math.round(avgPromptRow.avg_len) : 0;
+// ---------- Session events ----------
 
-  // Average response length
-  const avgRespRow = getDb().prepare(
-    `SELECT AVG(se.response_length) AS avg_len FROM session_event se
-     JOIN user u ON se.user_id = u.id
-     WHERE u.team_id = ? AND se.timestamp >= ? AND se.type = 'turn_complete' AND se.response_length IS NOT NULL${userFilter}`
-  ).get(teamId, since, ...userFilterParams);
-  const avgResponseLength = avgRespRow.avg_len ? Math.round(avgRespRow.avg_len) : 0;
+async function recordSessionEvent({ userId, sessionId, type, subscriptionId, detail }) {
+  await query(
+    `INSERT INTO session_event (user_id, session_id, type, subscription_id, detail)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [
+      userId,
+      sessionId || null,
+      type,
+      subscriptionId || null,
+      detail ? JSON.stringify(detail) : null,
+    ]
+  );
+}
 
-  // Average prompts per session
-  const sessionCounts = getDb().prepare(
-    `SELECT se.session_id, COUNT(*) AS count
-     FROM session_event se
-     JOIN user u ON se.user_id = u.id
-     WHERE u.team_id = ? AND se.timestamp >= ? AND se.type = 'prompt' AND se.session_id IS NOT NULL${userFilter}
-     GROUP BY se.session_id`
-  ).all(teamId, since, ...userFilterParams);
-  let avgPromptsPerSession = 0;
-  if (sessionCounts.length > 0) {
-    const totalSessionPrompts = sessionCounts.reduce((sum, r) => sum + r.count, 0);
-    avgPromptsPerSession = +(totalSessionPrompts / sessionCounts.length).toFixed(1);
+// ---------- Window math ----------
+
+function windowStart(windowType) {
+  const now = new Date();
+  if (windowType === 'sliding_24h') {
+    return new Date(now.getTime() - 24 * 60 * 60 * 1000);
   }
-
-  // Devices
-  const devicesQuery = opts.user_id
-    ? getDb().prepare('SELECT * FROM device WHERE user_id = ? ORDER BY last_seen DESC').all(opts.user_id)
-    : getDevicesByTeam(teamId);
-
-  return {
-    peak_hours: peakHours,
-    model_distribution: modelDistribution,
-    project_usage: projectUsage,
-    daily_active: dailyActive,
-    block_rate: blockRate,
-    avg_prompt_length: avgPromptLength,
-    avg_response_length: avgResponseLength,
-    avg_prompts_per_session: avgPromptsPerSession,
-    devices: devicesQuery,
-  };
+  if (windowType === 'daily') {
+    const d = new Date(now);
+    d.setUTCHours(0, 0, 0, 0);
+    return d;
+  }
+  if (windowType === 'weekly') {
+    const d = new Date(now);
+    d.setUTCHours(0, 0, 0, 0);
+    const dow = d.getUTCDay();
+    const offset = dow === 0 ? 6 : dow - 1;
+    d.setUTCDate(d.getUTCDate() - offset);
+    return d;
+  }
+  if (windowType === 'monthly') {
+    const d = new Date(now);
+    d.setUTCHours(0, 0, 0, 0);
+    d.setUTCDate(1);
+    return d;
+  }
+  // default: sliding 24h
+  return new Date(now.getTime() - 24 * 60 * 60 * 1000);
 }
 
 module.exports = {
   init,
-  seed,
   close,
-  getDb,
-  // Team
-  getTeam,
-  getDefaultTeam,
-  updateTeam,
-  // User
+  query,
+  ensureBootstrapAdmin,
+  // users
   getUser,
-  getUserByToken,
-  getUserBySlug,
-  getAllUsers,
+  getUserByEmail,
+  listUsers,
   createUser,
   updateUser,
   deleteUser,
-  // Limit Rules
-  getLimitRules,
-  createLimitRule,
-  deleteLimitRule,
-  deleteLimitRulesForUser,
-  // Usage
+  // tiers
+  listTiers,
+  getTier,
+  createTier,
+  updateTier,
+  deleteTier,
+  // pools
+  listPools,
+  getPoolById,
+  createPoolRow,
+  deletePool,
+  // subscriptions
+  listSubscriptions,
+  getSubscription,
+  createSubscription,
+  updateSubscription,
+  deleteSubscription,
+  // projects/sessions/messages
+  listProjects,
+  getProject,
+  createProject,
+  deleteProject,
+  listSessions,
+  getSession,
+  createSessionRow,
+  updateSession,
+  listMessages,
+  appendMessage,
+  // usage
   recordUsage,
-  getUsage,
-  getUsageWithCredits,
-  getUsageForWindow,
-  getRecentEvents,
-  cleanupOldEvents,
-  // Install Codes
-  createInstallCode,
-  useInstallCode,
-  // Device
-  upsertDevice,
-  getDevices,
-  getDevicesByTeam,
-  // Session Events / Analytics
+  sumUsageInWindow,
+  recentEvents,
+  // grants
+  listGrants,
+  sumActiveGrants,
+  createGrant,
+  // session events
   recordSessionEvent,
-  getSessionEvents,
-  getAnalytics,
-  // Helpers (exported for services)
-  calculateWindowStart,
-  getDatePartsInTZ,
+  // helpers
+  windowStart,
 };

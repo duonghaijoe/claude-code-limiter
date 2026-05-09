@@ -1,46 +1,52 @@
-version: "3.8"
+# Local dev stack: Postgres + portal server.
+# Subscription pods run from a separate compose file (Phase 2).
+#
+# Run with the workspace dir on your host bind-mounted to /workspaces in the container,
+# so projects created via the chat API get a real backing dir on disk.
 
 services:
-  limiter:
+  postgres:
+    image: postgres:16-alpine
+    container_name: portal-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: portal
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-portal}
+      POSTGRES_DB: portal
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U portal -d portal"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  server:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: claude-limiter
+    container_name: portal-server
     restart: unless-stopped
-    environment:
-      - NODE_ENV=production
-      - PORT=3000
-      - DATA_DIR=/data
-      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-changeme}
-      - JWT_SECRET=${JWT_SECRET:-}
-    volumes:
-      - limiter-data:/data
-    networks:
-      - limiter-net
-    expose:
-      - "3000"
-
-  caddy:
-    image: caddy:2
-    container_name: claude-limiter-caddy
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data
-      - caddy-config:/config
-    networks:
-      - limiter-net
     depends_on:
-      - limiter
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgres://portal:${POSTGRES_PASSWORD:-portal}@postgres:5432/portal
+      JWT_SECRET: ${JWT_SECRET:-}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-changeme}
+      WORKSPACE_ROOT: /workspaces
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+    ports:
+      - "3000:3000"
+    volumes:
+      # Bind your local workspaces dir into the container so created projects exist on disk.
+      # Override with WORKSPACES_HOST_DIR=/path/on/your/mac.
+      - ${WORKSPACES_HOST_DIR:-./.workspaces}:/workspaces
 
 volumes:
-  limiter-data:
-  caddy-data:
-  caddy-config:
-
-networks:
-  limiter-net:
-    driver: bridge
+  postgres-data:
