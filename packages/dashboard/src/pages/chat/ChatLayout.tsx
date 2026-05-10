@@ -326,28 +326,75 @@ function BalanceWidget({ balance, onRefresh }: { balance: Balance | null; onRefr
   if (!balance) {
     return <div className="text-xs text-zinc-500">No balance loaded.</div>;
   }
-  const remaining = Number(balance.balance) || 0;
-  const total = (Number(balance.budget) || 0) + (Number(balance.grants) || 0);
-  const pct = total > 0 ? Math.max(0, Math.min(100, (remaining / total) * 100)) : 0;
-  const color = balance.allowed ? 'bg-blue-500' : 'bg-red-500';
-  const windowLabel = balance.window?.type ?? '—';
+  const limits = balance.limits || [];
   return (
     <div>
-      <div className="flex items-center justify-between mb-1">
-        <span className="text-[11px] uppercase tracking-wider text-zinc-500">Credits ({windowLabel})</span>
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-[11px] uppercase tracking-wider text-zinc-500">Rate limits</span>
         <button onClick={onRefresh} className="text-[11px] text-zinc-500 hover:text-zinc-300 cursor-pointer">↻</button>
       </div>
-      <div className="text-sm text-zinc-200">
-        {remaining.toFixed(0)} <span className="text-zinc-500">/ {total.toFixed(0)}</span>
-      </div>
-      <div className="mt-2 h-1.5 rounded-full bg-zinc-800 overflow-hidden">
-        <div className={`h-full ${color} transition-all`} style={{ width: `${pct}%` }} />
+      {limits.length === 0 && (
+        <div className="text-[11px] text-zinc-500">{balance.reason || 'No limits configured.'}</div>
+      )}
+      <div className="space-y-3">
+        {limits.map((l) => <LimitRow key={l.id} limit={l} />)}
       </div>
       {!balance.allowed && balance.reason && (
         <div className="mt-2 text-[11px] text-red-400">{balance.reason}</div>
       )}
     </div>
   );
+}
+
+function LimitRow({ limit }: { limit: import('../../lib/types').LimitState }) {
+  const remaining = Number(limit.remaining) || 0;
+  const total = Number(limit.effective_budget) || 0;
+  const used = Number(limit.used) || 0;
+  const pctUsed = total > 0 ? Math.max(0, Math.min(100, (used / total) * 100)) : 0;
+  const exhausted = !limit.allowed;
+  const lowish = !exhausted && total > 0 && remaining / total < 0.1;
+  const color = exhausted ? 'bg-red-500' : lowish ? 'bg-amber-500' : 'bg-blue-500';
+  const resetsLabel = formatResets(limit);
+  return (
+    <div>
+      <div className="flex items-baseline justify-between gap-2">
+        <span className="text-[11px] text-zinc-300 truncate">{limit.label}</span>
+        <span className={`text-[11px] tabular-nums ${exhausted ? 'text-red-400' : 'text-zinc-400'}`}>
+          {remaining.toFixed(0)}<span className="text-zinc-600"> / {total.toFixed(0)}</span>
+        </span>
+      </div>
+      <div className="mt-1 h-1.5 rounded-full bg-zinc-800 overflow-hidden">
+        <div className={`h-full ${color} transition-all`} style={{ width: `${pctUsed}%` }} />
+      </div>
+      {resetsLabel && <div className="mt-1 text-[10px] text-zinc-500">{resetsLabel}</div>}
+    </div>
+  );
+}
+
+function formatResets(limit: import('../../lib/types').LimitState): string | null {
+  const w = limit.window;
+  if (!w) return null;
+  if (!w.resets_at) {
+    if (limit.kind === 'session') return `Resets ${w.hours ?? 5}h after first message`;
+    return null;
+  }
+  const resets = new Date(w.resets_at);
+  const ms = resets.getTime() - Date.now();
+  if (ms <= 0) return 'Resetting…';
+  const mins = Math.floor(ms / 60000);
+  const hours = Math.floor(mins / 60);
+  const days = Math.floor(hours / 24);
+  if (limit.kind === 'session' || days < 1) {
+    const h = hours % 24;
+    const m = mins % 60;
+    if (hours === 0) return `Resets in ${m}m`;
+    return `Resets in ${h}h ${m}m`;
+  }
+  // Weekly: show absolute UTC anchor.
+  const dowName = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'][resets.getUTCDay()];
+  const hh = String(resets.getUTCHours()).padStart(2, '0');
+  const mm = String(resets.getUTCMinutes()).padStart(2, '0');
+  return `Resets ${dowName} ${hh}:${mm} UTC (in ${days}d ${hours % 24}h)`;
 }
 
 function MessageBubble({ message }: { message: Message }) {

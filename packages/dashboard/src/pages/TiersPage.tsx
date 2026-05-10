@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api } from '../lib/api';
-import type { Pool, Tier, WindowType } from '../lib/types';
+import type { LimitKind, ModelClass, Pool, Tier, TierLimit } from '../lib/types';
 import { Card, CardBody, CardHeader } from '../components/Card';
 import { Button } from '../components/Button';
 import { Input, Select } from '../components/Input';
@@ -9,6 +9,23 @@ import { Table } from '../components/Table';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 
 type ShowToast = (title: string, msg: string, type?: 'info' | 'success' | 'warning' | 'error') => void;
+
+const DOW_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const MODEL_CLASSES: ModelClass[] = ['opus', 'sonnet', 'haiku'];
+
+function defaultLimits(): TierLimit[] {
+  return [
+    { id: 'session', label: 'Current session', kind: 'session', budget: 1500, window_hours: 5 },
+    { id: 'weekly_all', label: 'Weekly — all models', kind: 'weekly_all', budget: 10000, reset_dow: 1, reset_hour: 0 },
+  ];
+}
+
+function summarizeLimit(l: TierLimit): string {
+  if (l.kind === 'session') return `session ${l.window_hours ?? 5}h: ${l.budget}`;
+  if (l.kind === 'weekly_all') return `weekly all: ${l.budget}`;
+  if (l.kind === 'weekly_model') return `weekly ${(l.models || []).join('+')}: ${l.budget}`;
+  return `${l.kind}: ${l.budget}`;
+}
 
 export function TiersPage({ showToast }: { showToast: ShowToast }) {
   const [tiers, setTiers] = useState<Tier[]>([]);
@@ -55,7 +72,7 @@ export function TiersPage({ showToast }: { showToast: ShowToast }) {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-semibold text-zinc-100">Tiers</h1>
-          <p className="text-sm text-zinc-500 mt-1">Credit budgets, pool allowlists, and token weights.</p>
+          <p className="text-sm text-zinc-500 mt-1">Multi-limit budgets, pool allowlists, and token weights.</p>
         </div>
         <Button variant="primary" onClick={() => setCreating(true)}>+ New tier</Button>
       </div>
@@ -74,8 +91,20 @@ export function TiersPage({ showToast }: { showToast: ShowToast }) {
               emptyMessage="No tiers configured"
               columns={[
                 { key: 'name', header: 'Name', render: (t) => <span className="text-zinc-100 font-medium">{t.name}</span> },
-                { key: 'budget', header: 'Budget', render: (t) => <span className="text-zinc-300">{(Number(t.credit_budget) || 0).toFixed(0)}</span> },
-                { key: 'window', header: 'Window', render: (t) => <span className="text-zinc-400">{t.window_type}</span> },
+                {
+                  key: 'limits',
+                  header: 'Limits',
+                  render: (t) => (
+                    <div className="text-xs text-zinc-300 space-y-0.5">
+                      {(t.limits || []).length === 0 && <span className="text-zinc-500">— none —</span>}
+                      {(t.limits || []).map((l) => (
+                        <div key={l.id}>
+                          <span className="text-zinc-400">{l.label}:</span> {summarizeLimit(l)}
+                        </div>
+                      ))}
+                    </div>
+                  ),
+                },
                 {
                   key: 'pools',
                   header: 'Pools',
@@ -137,8 +166,11 @@ function TierModal({ tier, pools, onClose, onSaved, onError }: {
   onError: (m: string) => void;
 }) {
   const [name, setName] = useState(tier?.name ?? '');
-  const [budget, setBudget] = useState(String(tier?.credit_budget ?? 1000));
-  const [windowType, setWindowType] = useState<WindowType>(tier?.window_type ?? 'monthly');
+  const [limits, setLimits] = useState<TierLimit[]>(
+    tier && Array.isArray(tier.limits) && tier.limits.length > 0
+      ? tier.limits.map((l) => ({ ...l }))
+      : defaultLimits()
+  );
   const [allowed, setAllowed] = useState<string[]>(tier?.allowed_pools ?? []);
   const [failover, setFailover] = useState<string[]>(tier?.failover_pools ?? []);
   const [weightsJson, setWeightsJson] = useState(JSON.stringify(tier?.credit_weights ?? {
@@ -153,7 +185,50 @@ function TierModal({ tier, pools, onClose, onSaved, onError }: {
     setList(list.includes(poolId) ? list.filter((x) => x !== poolId) : [...list, poolId]);
   }
 
+  function updateLimit(idx: number, patch: Partial<TierLimit>) {
+    setLimits((prev) => prev.map((l, i) => (i === idx ? { ...l, ...patch } : l)));
+  }
+
+  function removeLimit(idx: number) {
+    setLimits((prev) => prev.filter((_, i) => i !== idx));
+  }
+
+  function addLimit(kind: LimitKind) {
+    if (kind === 'session') {
+      setLimits((prev) => [...prev, {
+        id: nextId(prev, 'session'),
+        label: 'Current session',
+        kind: 'session',
+        budget: 1500,
+        window_hours: 5,
+      }]);
+    } else if (kind === 'weekly_all') {
+      setLimits((prev) => [...prev, {
+        id: nextId(prev, 'weekly_all'),
+        label: 'Weekly — all models',
+        kind: 'weekly_all',
+        budget: 10000,
+        reset_dow: 1,
+        reset_hour: 0,
+      }]);
+    } else {
+      setLimits((prev) => [...prev, {
+        id: nextId(prev, 'weekly_sonnet'),
+        label: 'Weekly — Sonnet only',
+        kind: 'weekly_model',
+        budget: 5000,
+        reset_dow: 1,
+        reset_hour: 0,
+        models: ['sonnet'],
+      }]);
+    }
+  }
+
   async function submit() {
+    if (limits.length === 0) {
+      onError('Add at least one limit');
+      return;
+    }
     let weights: Record<string, number>;
     try {
       weights = JSON.parse(weightsJson);
@@ -165,8 +240,7 @@ function TierModal({ tier, pools, onClose, onSaved, onError }: {
     try {
       const body = {
         name,
-        credit_budget: Number(budget),
-        window_type: windowType,
+        limits,
         allowed_pools: allowed,
         failover_pools: failover,
         credit_weights: weights,
@@ -186,15 +260,33 @@ function TierModal({ tier, pools, onClose, onSaved, onError }: {
       <ModalHeader onClose={onClose}>{tier ? `Edit ${tier.name}` : 'New tier'}</ModalHeader>
       <ModalBody className="space-y-4">
         <Input label="Name" value={name} onChange={(e) => setName(e.target.value)} autoFocus />
-        <div className="grid grid-cols-2 gap-3">
-          <Input label="Credit budget" type="number" value={budget} onChange={(e) => setBudget(e.target.value)} />
-          <Select label="Window" value={windowType} onChange={(e) => setWindowType(e.target.value as WindowType)}>
-            <option value="daily">daily</option>
-            <option value="weekly">weekly</option>
-            <option value="monthly">monthly</option>
-            <option value="sliding_24h">sliding_24h</option>
-          </Select>
+
+        <div>
+          <div className="flex items-center justify-between mb-2">
+            <label className="block text-sm font-medium text-zinc-300">Rate limits</label>
+            <div className="flex items-center gap-2">
+              <Button size="sm" variant="secondary" onClick={() => addLimit('session')}>+ Session</Button>
+              <Button size="sm" variant="secondary" onClick={() => addLimit('weekly_all')}>+ Weekly all</Button>
+              <Button size="sm" variant="secondary" onClick={() => addLimit('weekly_model')}>+ Weekly model</Button>
+            </div>
+          </div>
+          <div className="space-y-3">
+            {limits.length === 0 && (
+              <div className="text-xs text-zinc-500 px-3 py-4 rounded-lg border border-zinc-800 bg-zinc-900/40">
+                No limits — add at least one.
+              </div>
+            )}
+            {limits.map((l, i) => (
+              <LimitEditor
+                key={i}
+                limit={l}
+                onChange={(patch) => updateLimit(i, patch)}
+                onRemove={() => removeLimit(i)}
+              />
+            ))}
+          </div>
         </div>
+
         <div>
           <label className="block text-sm font-medium text-zinc-300 mb-2">Allowed pools (in priority order)</label>
           <div className="space-y-1.5 max-h-40 overflow-y-auto rounded-lg border border-zinc-800 p-3 bg-zinc-900/40">
@@ -242,5 +334,117 @@ function TierModal({ tier, pools, onClose, onSaved, onError }: {
         <Button variant="primary" onClick={submit} disabled={busy || !name}>{busy ? 'Saving...' : tier ? 'Save' : 'Create'}</Button>
       </ModalFooter>
     </Modal>
+  );
+}
+
+function nextId(prev: TierLimit[], base: string): string {
+  if (!prev.some((l) => l.id === base)) return base;
+  let n = 2;
+  while (prev.some((l) => l.id === `${base}_${n}`)) n++;
+  return `${base}_${n}`;
+}
+
+function LimitEditor({ limit, onChange, onRemove }: {
+  limit: TierLimit;
+  onChange: (patch: Partial<TierLimit>) => void;
+  onRemove: () => void;
+}) {
+  function toggleModel(c: ModelClass) {
+    const cur = new Set(limit.models || []);
+    if (cur.has(c)) cur.delete(c); else cur.add(c);
+    onChange({ models: Array.from(cur) as ModelClass[] });
+  }
+
+  return (
+    <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-3 space-y-3">
+      <div className="grid grid-cols-12 gap-2">
+        <div className="col-span-3">
+          <Input
+            label="Id"
+            value={limit.id}
+            onChange={(e) => onChange({ id: e.target.value })}
+          />
+        </div>
+        <div className="col-span-5">
+          <Input
+            label="Label"
+            value={limit.label}
+            onChange={(e) => onChange({ label: e.target.value })}
+          />
+        </div>
+        <div className="col-span-4">
+          <Select
+            label="Kind"
+            value={limit.kind}
+            onChange={(e) => onChange({ kind: e.target.value as LimitKind })}
+          >
+            <option value="session">session</option>
+            <option value="weekly_all">weekly_all</option>
+            <option value="weekly_model">weekly_model</option>
+          </Select>
+        </div>
+      </div>
+      <div className="grid grid-cols-12 gap-2">
+        <div className="col-span-4">
+          <Input
+            label="Budget (credits)"
+            type="number"
+            value={String(limit.budget)}
+            onChange={(e) => onChange({ budget: Number(e.target.value) || 0 })}
+          />
+        </div>
+        {limit.kind === 'session' && (
+          <div className="col-span-4">
+            <Input
+              label="Window hours"
+              type="number"
+              value={String(limit.window_hours ?? 5)}
+              onChange={(e) => onChange({ window_hours: Number(e.target.value) || 1 })}
+            />
+          </div>
+        )}
+        {(limit.kind === 'weekly_all' || limit.kind === 'weekly_model') && (
+          <>
+            <div className="col-span-4">
+              <Select
+                label="Reset day (UTC)"
+                value={String(limit.reset_dow ?? 1)}
+                onChange={(e) => onChange({ reset_dow: Number(e.target.value) })}
+              >
+                {DOW_LABELS.map((d, i) => <option key={d} value={i}>{d}</option>)}
+              </Select>
+            </div>
+            <div className="col-span-4">
+              <Input
+                label="Reset hour (UTC)"
+                type="number"
+                value={String(limit.reset_hour ?? 0)}
+                onChange={(e) => onChange({ reset_hour: Math.max(0, Math.min(23, Number(e.target.value) || 0)) })}
+              />
+            </div>
+          </>
+        )}
+      </div>
+      {limit.kind === 'weekly_model' && (
+        <div>
+          <label className="block text-xs font-medium text-zinc-400 mb-1">Models in this bucket</label>
+          <div className="flex items-center gap-3">
+            {MODEL_CLASSES.map((c) => (
+              <label key={c} className="flex items-center gap-1.5 text-sm text-zinc-300 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={(limit.models || []).includes(c)}
+                  onChange={() => toggleModel(c)}
+                />
+                {c}
+              </label>
+            ))}
+          </div>
+        </div>
+      )}
+      <div className="flex justify-end">
+        <Button size="sm" variant="danger" onClick={onRemove}>Remove</Button>
+      </div>
+    </div>
   );
 }

@@ -1,4 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
+import { Terminal } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
+import '@xterm/xterm/css/xterm.css';
 import { api } from '../lib/api';
 import { Modal, ModalBody, ModalFooter, ModalHeader } from './Modal';
 import { Button } from './Button';
@@ -23,16 +26,59 @@ interface ServerFrame {
 
 export function SubAuthTerminal({ subscriptionId, podName, onClose, onAuthenticated }: Props) {
   const [phase, setPhase] = useState<Phase>('connecting');
-  const [output, setOutput] = useState('');
   const [errorText, setErrorText] = useState<string | null>(null);
-  const [input, setInput] = useState('');
   const wsRef = useRef<WebSocket | null>(null);
-  const outRef = useRef<HTMLPreElement | null>(null);
-  const inputRef = useRef<HTMLInputElement | null>(null);
+  const termRef = useRef<Terminal | null>(null);
+  const fitRef = useRef<FitAddon | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     let ws: WebSocket | null = null;
+
+    const term = new Terminal({
+      convertEol: true,
+      cursorBlink: true,
+      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+      fontSize: 12,
+      theme: {
+        background: '#09090b',
+        foreground: '#e4e4e7',
+        cursor: '#60a5fa',
+        selectionBackground: '#3f3f46',
+      },
+      allowProposedApi: true,
+    });
+    const fit = new FitAddon();
+    term.loadAddon(fit);
+    termRef.current = term;
+    fitRef.current = fit;
+
+    if (containerRef.current) {
+      term.open(containerRef.current);
+      try { fit.fit(); } catch { /* container not measured yet */ }
+    }
+
+    term.writeln('\x1b[90mOpening exec...\x1b[0m');
+
+    // Forward keystrokes to the WS as raw bytes — xterm already maps Enter,
+    // Ctrl+C, arrows, paste, etc. into the right escape sequences.
+    const dataDisp = term.onData((data) => {
+      const w = wsRef.current;
+      if (!w || w.readyState !== w.OPEN) return;
+      w.send(JSON.stringify({ type: 'data', data }));
+    });
+
+    const onResize = () => {
+      try {
+        fit.fit();
+        const w = wsRef.current;
+        if (w && w.readyState === w.OPEN) {
+          w.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+        }
+      } catch { /* ignore */ }
+    };
+    window.addEventListener('resize', onResize);
 
     (async () => {
       try {
@@ -42,10 +88,17 @@ export function SubAuthTerminal({ subscriptionId, podName, onClose, onAuthentica
         ws = new WebSocket(`${scheme}//${window.location.host}${start.ws_url}`);
         wsRef.current = ws;
 
+        ws.onopen = () => {
+          // Push initial size to the pty so output wraps to our viewport.
+          try {
+            ws?.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+          } catch { /* ignore */ }
+        };
+
         ws.onmessage = (ev) => {
           let frame: ServerFrame;
           try { frame = JSON.parse(ev.data); } catch { return; }
-          handleFrame(frame);
+          handleFrame(frame, term);
         };
         ws.onerror = () => {
           if (cancelled) return;
@@ -63,70 +116,58 @@ export function SubAuthTerminal({ subscriptionId, podName, onClose, onAuthentica
       }
     })();
 
+    // Refit shortly after mount once the modal animates in.
+    const fitTimer = window.setTimeout(() => {
+      try { fit.fit(); } catch { /* ignore */ }
+      term.focus();
+    }, 50);
+
     return () => {
       cancelled = true;
+      window.clearTimeout(fitTimer);
+      window.removeEventListener('resize', onResize);
+      try { dataDisp.dispose(); } catch { /* ignore */ }
       try { ws?.close(); } catch { /* ignore */ }
+      try { term.dispose(); } catch { /* ignore */ }
+      termRef.current = null;
+      fitRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [subscriptionId]);
 
-  function handleFrame(frame: ServerFrame) {
+  function handleFrame(frame: ServerFrame, term: Terminal) {
     switch (frame.type) {
       case 'ready':
         setPhase('ready');
         break;
       case 'data':
-        if (typeof frame.data === 'string') {
-          setOutput((prev) => prev + frame.data);
-          requestAnimationFrame(() => {
-            const el = outRef.current;
-            if (el) el.scrollTop = el.scrollHeight;
-          });
-        }
+        if (typeof frame.data === 'string') term.write(frame.data);
         break;
       case 'token-detected':
         setPhase('token');
         break;
       case 'saved':
         setPhase('saved');
+        term.writeln('\r\n\x1b[32m✓ Token saved — subscription is active.\x1b[0m');
         onAuthenticated();
         break;
       case 'exit':
         setPhase((p) => (p === 'saved' ? p : 'closed'));
+        if (typeof frame.code === 'number') {
+          term.writeln(`\r\n\x1b[90m[exec exited with code ${frame.code}]\x1b[0m`);
+        }
         break;
       case 'error':
         setPhase('error');
         setErrorText(`${frame.error}${frame.detail ? `: ${frame.detail}` : ''}`);
+        term.writeln(`\r\n\x1b[31m[error] ${frame.error}${frame.detail ? `: ${frame.detail}` : ''}\x1b[0m`);
         break;
-    }
-  }
-
-  function send(payload: object) {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== ws.OPEN) return;
-    ws.send(JSON.stringify(payload));
-  }
-
-  function submitInput(line: string, withNewline: boolean) {
-    if (!line && !withNewline) return;
-    send({ type: 'data', data: withNewline ? line + '\n' : line });
-    setInput('');
-    inputRef.current?.focus();
-  }
-
-  function handleKey(e: React.KeyboardEvent<HTMLInputElement>) {
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      submitInput(input, true);
-    } else if (e.ctrlKey && e.key.toLowerCase() === 'c') {
-      e.preventDefault();
-      send({ type: 'data', data: '' });
     }
   }
 
   const phaseLabel: Record<Phase, string> = {
     connecting: 'Connecting...',
-    ready: 'Connected — paste your subscription credentials',
+    ready: 'Connected — type into the terminal',
     token: 'Token detected, persisting...',
     saved: 'Token saved — subscription is active',
     closed: 'Session ended',
@@ -147,31 +188,11 @@ export function SubAuthTerminal({ subscriptionId, podName, onClose, onAuthentica
       <ModalHeader onClose={onClose}>Authenticate {podName}</ModalHeader>
       <ModalBody className="space-y-3">
         <div className={`text-xs font-medium ${phaseColor[phase]}`}>{phaseLabel[phase]}</div>
-        <pre
-          ref={outRef}
-          className="h-80 overflow-auto rounded-lg border border-zinc-800 bg-black/60 p-3 text-xs font-mono text-zinc-200 whitespace-pre-wrap break-words"
-        >
-          {output || (phase === 'connecting' ? 'Opening exec...\n' : '')}
-        </pre>
-        <div className="flex items-center gap-2">
-          <input
-            ref={inputRef}
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={handleKey}
-            disabled={phase !== 'ready' && phase !== 'token'}
-            placeholder="Type and press Enter"
-            className="flex-1 rounded-lg border border-zinc-700 bg-zinc-800/50 px-3 py-2 text-sm font-mono text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:ring-2 focus:ring-blue-500/40 disabled:opacity-40"
-          />
-          <Button
-            size="sm"
-            variant="secondary"
-            onClick={() => submitInput(input, true)}
-            disabled={phase !== 'ready' && phase !== 'token'}
-          >
-            Send
-          </Button>
-        </div>
+        <div
+          ref={containerRef}
+          className="h-96 rounded-lg border border-zinc-800 bg-black/80 p-2 overflow-hidden"
+          onClick={() => termRef.current?.focus()}
+        />
         <p className="text-[11px] text-zinc-500">
           Run <code>claude setup-token</code> inside the pod and follow the prompts. The OAuth token (sk-ant-oat-...) is captured automatically.
         </p>

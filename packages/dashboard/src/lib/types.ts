@@ -7,20 +7,47 @@ export type WindowType = 'daily' | 'weekly' | 'monthly' | 'sliding_24h';
 export type UserRole = 'admin' | 'member';
 export type UserStatus = 'active' | 'paused' | 'killed';
 
-export interface BalanceWindow {
-  type: WindowType;
-  since: string;
+export type LimitKind = 'session' | 'weekly_all' | 'weekly_model';
+export type ModelClass = 'opus' | 'sonnet' | 'haiku';
+
+export interface TierLimit {
+  id: string;
+  label: string;
+  kind: LimitKind;
+  budget: number;
+  window_hours?: number;
+  reset_dow?: number;   // 0=Sun..6=Sat (UTC)
+  reset_hour?: number;  // 0..23 UTC
+  models?: ModelClass[];
+}
+
+export interface LimitWindow {
+  since: string | null;
+  resets_at: string | null;
+  hours?: number;
+  reset_dow?: number;
+  reset_hour?: number;
+}
+
+export interface LimitState {
+  id: string;
+  label: string;
+  kind: LimitKind;
+  budget: number;
+  effective_budget: number;
+  used: number;
+  remaining: number;
+  window: LimitWindow | null;
+  models: ModelClass[] | null;
+  allowed: boolean;
+  error?: string;
 }
 
 export interface Balance {
   allowed: boolean;
   reason: string | null;
-  balance: number;
-  used: number;
-  budget: number;
+  limits: LimitState[];
   grants: number;
-  window: BalanceWindow | null;
-  weights: Record<string, unknown>;
   tier: Tier | null;
 }
 
@@ -47,8 +74,9 @@ export interface User {
 export interface Tier {
   id: string;
   name: string;
-  credit_budget: string | number;
-  window_type: WindowType;
+  credit_budget: string | number;       // legacy column, kept for one release
+  window_type: WindowType;               // legacy column, kept for one release
+  limits: TierLimit[];
   allowed_pools: string[];
   failover_pools: string[];
   credit_weights: CreditWeights;

@@ -100,6 +100,12 @@ async function attach({ subscriptionId, ws }) {
     return;
   }
 
+  // Force a very wide pty so `claude setup-token` doesn't wrap the OAuth
+  // token across lines. The token regex matches a contiguous run of token
+  // characters; a soft wrap would truncate it. Client may resize again to
+  // its actual viewport — this is just the safe default.
+  try { await exec.resize({ w: 240, h: 40 }); } catch { /* swallow */ }
+
   safeSend(ws, { type: 'ready', subscription_id: subscriptionId });
 
   let captured = false;

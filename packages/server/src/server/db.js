@@ -105,6 +105,11 @@ async function runMigrations() {
       ended_at        TIMESTAMPTZ
     );
 
+    -- Claude Agent SDK session id (returned in result.session_id). Distinct
+    -- from session.id (our row UUID). Used as the SDK resume target on
+    -- subsequent turns so the model continues the same conversation.
+    ALTER TABLE session ADD COLUMN IF NOT EXISTS claude_session_id TEXT;
+
     CREATE TABLE IF NOT EXISTS message (
       id          TEXT PRIMARY KEY,
       session_id  TEXT NOT NULL REFERENCES session(id) ON DELETE CASCADE,
@@ -153,7 +158,50 @@ async function runMigrations() {
     CREATE INDEX IF NOT EXISTS idx_session_event_user_ts ON session_event(user_id, timestamp);
     CREATE INDEX IF NOT EXISTS idx_credit_grant_user ON credit_grant(user_id, expires_at);
     CREATE INDEX IF NOT EXISTS idx_app_user_email ON app_user(email);
+
+    -- Multi-limit support: tier.limits is the new source of truth. The legacy
+    -- credit_budget + window_type columns are kept for one release so external
+    -- tooling does not break, but server code reads exclusively from limits.
+    ALTER TABLE tier ADD COLUMN IF NOT EXISTS limits JSONB NOT NULL DEFAULT '[]'::jsonb;
   `);
+
+  // Backfill any tier whose limits array is still empty by deriving a single
+  // weekly_all entry from the legacy columns. Idempotent: only touches rows
+  // where jsonb_array_length(limits) = 0.
+  await backfillTierLimits();
+}
+
+async function backfillTierLimits() {
+  const { rows } = await query(
+    `SELECT id, name, credit_budget, window_type FROM tier WHERE jsonb_array_length(limits) = 0`
+  );
+  for (const r of rows) {
+    const limit = legacyToLimit(r);
+    await query(
+      `UPDATE tier SET limits = $1::jsonb WHERE id = $2`,
+      [JSON.stringify([limit]), r.id]
+    );
+  }
+  if (rows.length > 0) {
+    console.log(`[db] backfilled limits[] on ${rows.length} tier(s)`);
+  }
+}
+
+function legacyToLimit({ credit_budget, window_type }) {
+  const budget = Number(credit_budget) || 0;
+  if (window_type === 'sliding_24h') {
+    return { id: 'session', label: 'Current session', kind: 'session', budget, window_hours: 24 };
+  }
+  if (window_type === 'daily') {
+    return { id: 'daily', label: 'Daily', kind: 'session', budget, window_hours: 24 };
+  }
+  if (window_type === 'monthly') {
+    // Approximate as a 30-day sliding window — exact monthly anchors weren't
+    // a documented requirement and the new model only ships session+weekly.
+    return { id: 'monthly', label: 'Monthly', kind: 'session', budget, window_hours: 24 * 30 };
+  }
+  // weekly (or unknown): UTC Monday 00:00.
+  return { id: 'weekly_all', label: 'Weekly — all models', kind: 'weekly_all', budget, reset_dow: 1, reset_hour: 0 };
 }
 
 async function close() {
@@ -248,16 +296,21 @@ async function getTier(id) {
   return rows[0] || null;
 }
 
-async function createTier({ name, creditBudget, windowType, allowedPools, failoverPools, creditWeights }) {
+async function createTier({ name, creditBudget, windowType, limits, allowedPools, failoverPools, creditWeights }) {
   const id = uuidv4();
+  // Legacy columns are required NOT NULL — keep them populated from the first
+  // limit (or zeros) so old reads don't 500 while we transition.
+  const legacyBudget = creditBudget !== undefined ? creditBudget : (Array.isArray(limits) && limits[0] ? Number(limits[0].budget) || 0 : 0);
+  const legacyWindow = windowType !== undefined ? windowType : 'weekly';
   await query(
-    `INSERT INTO tier (id, name, credit_budget, window_type, allowed_pools, failover_pools, credit_weights)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+    `INSERT INTO tier (id, name, credit_budget, window_type, limits, allowed_pools, failover_pools, credit_weights)
+     VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8)`,
     [
       id,
       name,
-      creditBudget,
-      windowType,
+      legacyBudget,
+      legacyWindow,
+      JSON.stringify(Array.isArray(limits) ? limits : []),
       JSON.stringify(allowedPools || []),
       JSON.stringify(failoverPools || []),
       JSON.stringify(creditWeights),
@@ -273,6 +326,7 @@ async function updateTier(id, fields) {
   if (fields.name !== undefined) { sets.push(`name = $${i++}`); values.push(fields.name); }
   if (fields.credit_budget !== undefined) { sets.push(`credit_budget = $${i++}`); values.push(fields.credit_budget); }
   if (fields.window_type !== undefined) { sets.push(`window_type = $${i++}`); values.push(fields.window_type); }
+  if (fields.limits !== undefined) { sets.push(`limits = $${i++}::jsonb`); values.push(JSON.stringify(fields.limits)); }
   if (fields.allowed_pools !== undefined) { sets.push(`allowed_pools = $${i++}`); values.push(JSON.stringify(fields.allowed_pools)); }
   if (fields.failover_pools !== undefined) { sets.push(`failover_pools = $${i++}`); values.push(JSON.stringify(fields.failover_pools)); }
   if (fields.credit_weights !== undefined) { sets.push(`credit_weights = $${i++}`); values.push(JSON.stringify(fields.credit_weights)); }
@@ -433,6 +487,7 @@ async function updateSession(id, fields) {
   if (fields.pinned_until !== undefined) { sets.push(`pinned_until = $${i++}`); values.push(fields.pinned_until); }
   if (fields.status !== undefined) { sets.push(`status = $${i++}`); values.push(fields.status); }
   if (fields.ended_at !== undefined) { sets.push(`ended_at = $${i++}`); values.push(fields.ended_at); }
+  if (fields.claude_session_id !== undefined) { sets.push(`claude_session_id = $${i++}`); values.push(fields.claude_session_id); }
   if (sets.length === 0) return getSession(id);
   values.push(id);
   await query(`UPDATE session SET ${sets.join(', ')} WHERE id = $${i}`, values);
@@ -486,6 +541,42 @@ async function sumUsageInWindow(userId, since) {
        FROM usage_event
       WHERE user_id = $1 AND timestamp >= $2`,
     [userId, since]
+  );
+  return Number(rows[0].total);
+}
+
+// Both the earliest event timestamp inside the window and the total cost.
+// Used by `session` limits to anchor a sliding window on the first message.
+async function usageStatsInWindow({ userId, since }) {
+  const { rows } = await query(
+    `SELECT MIN(timestamp) AS first_ts, COALESCE(SUM(credit_cost), 0)::bigint AS total
+       FROM usage_event
+      WHERE user_id = $1 AND timestamp >= $2`,
+    [userId, since]
+  );
+  return {
+    firstTs: rows[0].first_ts || null,
+    total: Number(rows[0].total),
+  };
+}
+
+// Sum credit cost where the model id falls into one of the given classes.
+// Classes are matched by substring (case-insensitive) on the model id, e.g.
+// 'sonnet' matches 'claude-sonnet-4-6'. Unknown classes match nothing.
+async function sumUsageInWindowByClass({ userId, since, classes }) {
+  if (!Array.isArray(classes) || classes.length === 0) return 0;
+  const { rows } = await query(
+    `SELECT COALESCE(SUM(credit_cost), 0)::bigint AS total
+       FROM usage_event
+      WHERE user_id = $1
+        AND timestamp >= $2
+        AND CASE
+          WHEN model ILIKE '%opus%'   THEN 'opus'
+          WHEN model ILIKE '%sonnet%' THEN 'sonnet'
+          WHEN model ILIKE '%haiku%'  THEN 'haiku'
+          ELSE 'other'
+        END = ANY($3::text[])`,
+    [userId, since, classes]
   );
   return Number(rows[0].total);
 }
@@ -635,6 +726,8 @@ module.exports = {
   // usage
   recordUsage,
   sumUsageInWindow,
+  usageStatsInWindow,
+  sumUsageInWindowByClass,
   recentEvents,
   // grants
   listGrants,

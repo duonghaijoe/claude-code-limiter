@@ -173,20 +173,39 @@ router.post('/sessions/:id/messages', async (req, res, next) => {
     let assistantText = '';
     let usage = null;
     let resultModel = model || null;
+    let resultClaudeSessionId = null;
+    let resultIsError = false;
 
     try {
       for await (const evt of routed.events) {
+        // Pod emits its own `done` to close its half of the stream. Don't
+        // relay it — chat-api owns the client-facing protocol (meta +
+        // done) and forwarding the pod's done duplicates the close.
+        if (evt.event === 'done') continue;
         send(evt.event, evt.data);
         if (evt.event === 'result' && evt.data && evt.data.type === 'result') {
           if (typeof evt.data.result === 'string') assistantText = evt.data.result;
           if (evt.data.usage) usage = evt.data.usage;
           if (evt.data.model) resultModel = evt.data.model;
+          if (typeof evt.data.session_id === 'string') resultClaudeSessionId = evt.data.session_id;
+          if (evt.data.is_error) resultIsError = true;
         }
       }
     } catch (err) {
       send('error', { error: 'stream_error', detail: err.message });
       res.end();
       return;
+    }
+
+    // Persist the SDK's session id so the next turn can resume the same
+    // conversation. Only on success — error turns get a fresh id we don't
+    // want to lock in.
+    if (!resultIsError && resultClaudeSessionId && resultClaudeSessionId !== session.claude_session_id) {
+      try {
+        await db.updateSession(session.id, { claude_session_id: resultClaudeSessionId });
+      } catch (err) {
+        send('error', { error: 'persist_session_failed', detail: err.message });
+      }
     }
 
     let creditCost = 0;

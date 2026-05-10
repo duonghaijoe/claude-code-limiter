@@ -191,7 +191,9 @@ async function route({ user, session, project, prompt, model }) {
       runResp = await postRun(sub, {
         prompt,
         workspaceDir: project.workspace_path,
-        sessionId: session.id,
+        // SDK resume target — distinct from session.id. undefined on the
+        // first turn; populated from a prior result.session_id afterward.
+        sessionId: session.claude_session_id || undefined,
         oauthToken: sub.oauth_token,
         model: model || undefined,
       });

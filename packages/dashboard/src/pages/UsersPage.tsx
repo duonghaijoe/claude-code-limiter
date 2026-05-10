@@ -106,15 +106,26 @@ export function UsersPage({ showToast }: { showToast: ShowToast }) {
                 },
                 {
                   key: 'balance',
-                  header: 'Credits',
+                  header: 'Limits',
                   render: (u) => {
                     if (!u.balance) return <span className="text-zinc-500">—</span>;
-                    const remaining = Number(u.balance.balance) || 0;
-                    const total = (Number(u.balance.budget) || 0) + (Number(u.balance.grants) || 0);
+                    const limits = u.balance.limits || [];
+                    if (limits.length === 0) {
+                      return <span className="text-zinc-500">—</span>;
+                    }
                     return (
-                      <span className={remaining <= 0 ? 'text-red-400' : 'text-zinc-200'}>
-                        {remaining.toFixed(0)} / {total.toFixed(0)}
-                      </span>
+                      <div className="text-xs space-y-0.5">
+                        {limits.map((l) => {
+                          const remaining = Number(l.remaining) || 0;
+                          const total = Number(l.effective_budget) || 0;
+                          const cls = !l.allowed ? 'text-red-400' : remaining <= total * 0.1 ? 'text-amber-300' : 'text-zinc-200';
+                          return (
+                            <div key={l.id} className={cls}>
+                              <span className="text-zinc-500">{l.label}:</span> {remaining.toFixed(0)} / {total.toFixed(0)}
+                            </div>
+                          );
+                        })}
+                      </div>
                     );
                   },
                 },

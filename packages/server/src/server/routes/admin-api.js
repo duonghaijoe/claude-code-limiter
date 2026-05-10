@@ -99,12 +99,19 @@ router.get('/tiers', async (req, res, next) => {
 
 router.post('/tiers', async (req, res, next) => {
   try {
-    const { name, credit_budget, window_type, allowed_pools, failover_pools, credit_weights } = req.body;
-    if (!name || credit_budget == null || !window_type || !credit_weights) {
-      return res.status(400).json({ error: 'name, credit_budget, window_type, credit_weights are required' });
+    const { name, limits, credit_budget, window_type, allowed_pools, failover_pools, credit_weights } = req.body;
+    if (!name || !credit_weights) {
+      return res.status(400).json({ error: 'name and credit_weights are required' });
     }
+    if (!Array.isArray(limits) || limits.length === 0) {
+      return res.status(400).json({ error: 'limits[] is required (at least one entry)' });
+    }
+    const validation = validateLimits(limits);
+    if (validation) return res.status(400).json({ error: validation });
     const tier = await db.createTier({
       name,
+      limits,
+      // legacy columns: optional, derived from first limit when omitted
       creditBudget: credit_budget,
       windowType: window_type,
       allowedPools: allowed_pools,
@@ -115,10 +122,38 @@ router.post('/tiers', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+function validateLimits(limits) {
+  const seen = new Set();
+  for (const l of limits) {
+    if (!l || typeof l !== 'object') return 'limit must be an object';
+    if (!l.id || typeof l.id !== 'string') return 'limit.id required';
+    if (seen.has(l.id)) return `duplicate limit id: ${l.id}`;
+    seen.add(l.id);
+    if (!['session', 'weekly_all', 'weekly_model'].includes(l.kind)) {
+      return `limit.kind must be session|weekly_all|weekly_model (got ${l.kind})`;
+    }
+    if (typeof l.budget !== 'number' || l.budget < 0) return 'limit.budget must be a non-negative number';
+    if (l.kind === 'session' && (!l.window_hours || l.window_hours <= 0)) {
+      return 'session limit requires window_hours > 0';
+    }
+    if (l.kind === 'weekly_model' && (!Array.isArray(l.models) || l.models.length === 0)) {
+      return 'weekly_model limit requires models[] with at least one class';
+    }
+  }
+  return null;
+}
+
 router.put('/tiers/:id', async (req, res, next) => {
   try {
     const tier = await db.getTier(req.params.id);
     if (!tier) return res.status(404).json({ error: 'Tier not found' });
+    if (req.body.limits !== undefined) {
+      if (!Array.isArray(req.body.limits) || req.body.limits.length === 0) {
+        return res.status(400).json({ error: 'limits[] must be a non-empty array' });
+      }
+      const validation = validateLimits(req.body.limits);
+      if (validation) return res.status(400).json({ error: validation });
+    }
     const updated = await db.updateTier(tier.id, req.body);
     res.json({ tier: updated });
   } catch (err) { next(err); }
