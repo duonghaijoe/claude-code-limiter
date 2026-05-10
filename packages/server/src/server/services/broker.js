@@ -172,7 +172,18 @@ async function route({ user, session, project, prompt, model }) {
   let lastError = null;
 
   while (true) {
-    const sub = await pickSubscription({ user, session, exclude: tried });
+    let sub;
+    try {
+      sub = await pickSubscription({ user, session, exclude: tried });
+    } catch (err) {
+      // If we already tried at least one pod and all failed at the transport
+      // layer, the more useful error is the actual failure — not the generic
+      // "no_capacity" that pickSubscription reports once candidates exhaust.
+      if (lastError && err instanceof BrokerError && err.code === 'no_capacity') {
+        throw lastError;
+      }
+      throw err;
+    }
     tried.add(sub.id);
 
     let runResp;
@@ -185,6 +196,7 @@ async function route({ user, session, project, prompt, model }) {
         model: model || undefined,
       });
     } catch (err) {
+      console.warn(`[broker] pod unreachable sub=${sub.id} endpoint=${sub.pod_endpoint}: ${err.message}`);
       lastError = err;
       continue;
     }
@@ -192,12 +204,14 @@ async function route({ user, session, project, prompt, model }) {
     const { res } = runResp;
 
     if (res.statusCode === 429) {
+      console.warn(`[broker] pod 429 sub=${sub.id} → cool_down`);
       await markCoolDown(sub.id);
       res.resume(); // drain
       lastError = new BrokerError('rate_limited', 'Pod returned 429', 429);
       continue;
     }
     if (res.statusCode >= 500) {
+      console.warn(`[broker] pod ${res.statusCode} sub=${sub.id} → retry`);
       res.resume();
       lastError = new BrokerError('pod_error', `Pod returned ${res.statusCode}`, 502);
       continue;
