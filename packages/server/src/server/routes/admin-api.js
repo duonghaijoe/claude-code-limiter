@@ -99,7 +99,7 @@ router.get('/tiers', async (req, res, next) => {
 
 router.post('/tiers', async (req, res, next) => {
   try {
-    const { name, limits, credit_budget, window_type, allowed_pools, failover_pools, credit_weights } = req.body;
+    const { name, limits, allowed_pools, failover_pools, credit_weights } = req.body;
     if (!name || !credit_weights) {
       return res.status(400).json({ error: 'name and credit_weights are required' });
     }
@@ -111,9 +111,6 @@ router.post('/tiers', async (req, res, next) => {
     const tier = await db.createTier({
       name,
       limits,
-      // legacy columns: optional, derived from first limit when omitted
-      creditBudget: credit_budget,
-      windowType: window_type,
       allowedPools: allowed_pools,
       failoverPools: failover_pools,
       creditWeights: credit_weights,

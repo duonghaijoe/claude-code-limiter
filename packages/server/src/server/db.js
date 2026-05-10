@@ -38,8 +38,7 @@ async function runMigrations() {
     CREATE TABLE IF NOT EXISTS tier (
       id              TEXT PRIMARY KEY,
       name            TEXT NOT NULL UNIQUE,
-      credit_budget   BIGINT NOT NULL,
-      window_type     TEXT NOT NULL,
+      limits          JSONB NOT NULL DEFAULT '[]'::jsonb,
       allowed_pools   JSONB NOT NULL DEFAULT '[]'::jsonb,
       failover_pools  JSONB NOT NULL DEFAULT '[]'::jsonb,
       credit_weights  JSONB NOT NULL,
@@ -159,49 +158,11 @@ async function runMigrations() {
     CREATE INDEX IF NOT EXISTS idx_credit_grant_user ON credit_grant(user_id, expires_at);
     CREATE INDEX IF NOT EXISTS idx_app_user_email ON app_user(email);
 
-    -- Multi-limit support: tier.limits is the new source of truth. The legacy
-    -- credit_budget + window_type columns are kept for one release so external
-    -- tooling does not break, but server code reads exclusively from limits.
-    ALTER TABLE tier ADD COLUMN IF NOT EXISTS limits JSONB NOT NULL DEFAULT '[]'::jsonb;
+    -- Drop legacy single-budget columns. Pre-release cleanup; no migration
+    -- path needed. Existing dev DBs already have limits[] populated.
+    ALTER TABLE tier DROP COLUMN IF EXISTS credit_budget;
+    ALTER TABLE tier DROP COLUMN IF EXISTS window_type;
   `);
-
-  // Backfill any tier whose limits array is still empty by deriving a single
-  // weekly_all entry from the legacy columns. Idempotent: only touches rows
-  // where jsonb_array_length(limits) = 0.
-  await backfillTierLimits();
-}
-
-async function backfillTierLimits() {
-  const { rows } = await query(
-    `SELECT id, name, credit_budget, window_type FROM tier WHERE jsonb_array_length(limits) = 0`
-  );
-  for (const r of rows) {
-    const limit = legacyToLimit(r);
-    await query(
-      `UPDATE tier SET limits = $1::jsonb WHERE id = $2`,
-      [JSON.stringify([limit]), r.id]
-    );
-  }
-  if (rows.length > 0) {
-    console.log(`[db] backfilled limits[] on ${rows.length} tier(s)`);
-  }
-}
-
-function legacyToLimit({ credit_budget, window_type }) {
-  const budget = Number(credit_budget) || 0;
-  if (window_type === 'sliding_24h') {
-    return { id: 'session', label: 'Current session', kind: 'session', budget, window_hours: 24 };
-  }
-  if (window_type === 'daily') {
-    return { id: 'daily', label: 'Daily', kind: 'session', budget, window_hours: 24 };
-  }
-  if (window_type === 'monthly') {
-    // Approximate as a 30-day sliding window — exact monthly anchors weren't
-    // a documented requirement and the new model only ships session+weekly.
-    return { id: 'monthly', label: 'Monthly', kind: 'session', budget, window_hours: 24 * 30 };
-  }
-  // weekly (or unknown): UTC Monday 00:00.
-  return { id: 'weekly_all', label: 'Weekly — all models', kind: 'weekly_all', budget, reset_dow: 1, reset_hour: 0 };
 }
 
 async function close() {
@@ -296,20 +257,14 @@ async function getTier(id) {
   return rows[0] || null;
 }
 
-async function createTier({ name, creditBudget, windowType, limits, allowedPools, failoverPools, creditWeights }) {
+async function createTier({ name, limits, allowedPools, failoverPools, creditWeights }) {
   const id = uuidv4();
-  // Legacy columns are required NOT NULL — keep them populated from the first
-  // limit (or zeros) so old reads don't 500 while we transition.
-  const legacyBudget = creditBudget !== undefined ? creditBudget : (Array.isArray(limits) && limits[0] ? Number(limits[0].budget) || 0 : 0);
-  const legacyWindow = windowType !== undefined ? windowType : 'weekly';
   await query(
-    `INSERT INTO tier (id, name, credit_budget, window_type, limits, allowed_pools, failover_pools, credit_weights)
-     VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8)`,
+    `INSERT INTO tier (id, name, limits, allowed_pools, failover_pools, credit_weights)
+     VALUES ($1, $2, $3::jsonb, $4, $5, $6)`,
     [
       id,
       name,
-      legacyBudget,
-      legacyWindow,
       JSON.stringify(Array.isArray(limits) ? limits : []),
       JSON.stringify(allowedPools || []),
       JSON.stringify(failoverPools || []),
@@ -324,8 +279,6 @@ async function updateTier(id, fields) {
   const values = [];
   let i = 1;
   if (fields.name !== undefined) { sets.push(`name = $${i++}`); values.push(fields.name); }
-  if (fields.credit_budget !== undefined) { sets.push(`credit_budget = $${i++}`); values.push(fields.credit_budget); }
-  if (fields.window_type !== undefined) { sets.push(`window_type = $${i++}`); values.push(fields.window_type); }
   if (fields.limits !== undefined) { sets.push(`limits = $${i++}::jsonb`); values.push(JSON.stringify(fields.limits)); }
   if (fields.allowed_pools !== undefined) { sets.push(`allowed_pools = $${i++}`); values.push(JSON.stringify(fields.allowed_pools)); }
   if (fields.failover_pools !== undefined) { sets.push(`failover_pools = $${i++}`); values.push(JSON.stringify(fields.failover_pools)); }
@@ -652,36 +605,6 @@ async function recordSessionEvent({ userId, sessionId, type, subscriptionId, det
   );
 }
 
-// ---------- Window math ----------
-
-function windowStart(windowType) {
-  const now = new Date();
-  if (windowType === 'sliding_24h') {
-    return new Date(now.getTime() - 24 * 60 * 60 * 1000);
-  }
-  if (windowType === 'daily') {
-    const d = new Date(now);
-    d.setUTCHours(0, 0, 0, 0);
-    return d;
-  }
-  if (windowType === 'weekly') {
-    const d = new Date(now);
-    d.setUTCHours(0, 0, 0, 0);
-    const dow = d.getUTCDay();
-    const offset = dow === 0 ? 6 : dow - 1;
-    d.setUTCDate(d.getUTCDate() - offset);
-    return d;
-  }
-  if (windowType === 'monthly') {
-    const d = new Date(now);
-    d.setUTCHours(0, 0, 0, 0);
-    d.setUTCDate(1);
-    return d;
-  }
-  // default: sliding 24h
-  return new Date(now.getTime() - 24 * 60 * 60 * 1000);
-}
-
 module.exports = {
   init,
   close,
@@ -735,6 +658,4 @@ module.exports = {
   createGrant,
   // session events
   recordSessionEvent,
-  // helpers
-  windowStart,
 };

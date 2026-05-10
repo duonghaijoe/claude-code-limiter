@@ -56,25 +56,6 @@ export function usagePct(used: number, limit: number): number {
   return p > 1 ? 1 : p;
 }
 
-export function getModelLimit(
-  limits: Array<{ type: string; model?: string; window?: string; value?: number }>,
-  model: string,
-  windowType: string = 'daily',
-): number {
-  for (const r of limits) {
-    if (r.type === 'per_model' && r.model === model && r.window === windowType) {
-      return r.value ?? -1;
-    }
-  }
-  return -1;
-}
-
-export function getCreditRule(
-  limits: Array<{ type: string; window?: string; value?: number }>,
-): { type: string; window?: string; value?: number } | null {
-  return limits.find((r) => r.type === 'credits') ?? null;
-}
-
 export function slugify(name: string): string {
   return name
     .toLowerCase()
