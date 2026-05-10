@@ -109,8 +109,8 @@ export function UsersPage({ showToast }: { showToast: ShowToast }) {
                   header: 'Credits',
                   render: (u) => {
                     if (!u.balance) return <span className="text-zinc-500">—</span>;
-                    const remaining = u.balance.remaining;
-                    const total = u.balance.budget + u.balance.granted;
+                    const remaining = Number(u.balance.balance) || 0;
+                    const total = (Number(u.balance.budget) || 0) + (Number(u.balance.grants) || 0);
                     return (
                       <span className={remaining <= 0 ? 'text-red-400' : 'text-zinc-200'}>
                         {remaining.toFixed(0)} / {total.toFixed(0)}

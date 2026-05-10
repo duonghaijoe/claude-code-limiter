@@ -7,15 +7,21 @@ export type WindowType = 'daily' | 'weekly' | 'monthly' | 'sliding_24h';
 export type UserRole = 'admin' | 'member';
 export type UserStatus = 'active' | 'paused' | 'killed';
 
+export interface BalanceWindow {
+  type: WindowType;
+  since: string;
+}
+
 export interface Balance {
   allowed: boolean;
+  reason: string | null;
+  balance: number;
+  used: number;
   budget: number;
-  granted: number;
-  spent: number;
-  remaining: number;
-  window_type: WindowType;
-  window_start?: string;
-  reason?: string;
+  grants: number;
+  window: BalanceWindow | null;
+  weights: Record<string, unknown>;
+  tier: Tier | null;
 }
 
 export interface CreditWeights {
@@ -41,7 +47,7 @@ export interface User {
 export interface Tier {
   id: string;
   name: string;
-  credit_budget: number;
+  credit_budget: string | number;
   window_type: WindowType;
   allowed_pools: string[];
   failover_pools: string[];

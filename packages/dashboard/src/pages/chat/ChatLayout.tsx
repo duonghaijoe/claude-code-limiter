@@ -326,17 +326,19 @@ function BalanceWidget({ balance, onRefresh }: { balance: Balance | null; onRefr
   if (!balance) {
     return <div className="text-xs text-zinc-500">No balance loaded.</div>;
   }
-  const total = balance.budget + balance.granted;
-  const pct = total > 0 ? Math.max(0, Math.min(100, (balance.remaining / total) * 100)) : 0;
+  const remaining = Number(balance.balance) || 0;
+  const total = (Number(balance.budget) || 0) + (Number(balance.grants) || 0);
+  const pct = total > 0 ? Math.max(0, Math.min(100, (remaining / total) * 100)) : 0;
   const color = balance.allowed ? 'bg-blue-500' : 'bg-red-500';
+  const windowLabel = balance.window?.type ?? '—';
   return (
     <div>
       <div className="flex items-center justify-between mb-1">
-        <span className="text-[11px] uppercase tracking-wider text-zinc-500">Credits ({balance.window_type})</span>
+        <span className="text-[11px] uppercase tracking-wider text-zinc-500">Credits ({windowLabel})</span>
         <button onClick={onRefresh} className="text-[11px] text-zinc-500 hover:text-zinc-300 cursor-pointer">↻</button>
       </div>
       <div className="text-sm text-zinc-200">
-        {balance.remaining.toFixed(0)} <span className="text-zinc-500">/ {total.toFixed(0)}</span>
+        {remaining.toFixed(0)} <span className="text-zinc-500">/ {total.toFixed(0)}</span>
       </div>
       <div className="mt-2 h-1.5 rounded-full bg-zinc-800 overflow-hidden">
         <div className={`h-full ${color} transition-all`} style={{ width: `${pct}%` }} />

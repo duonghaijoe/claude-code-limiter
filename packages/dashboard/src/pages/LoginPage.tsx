@@ -7,6 +7,7 @@ import { Input } from '../components/Input';
 export function LoginPage() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const navigate = useNavigate();
@@ -51,14 +52,27 @@ export function LoginPage() {
               autoFocus
               autoComplete="email"
             />
-            <Input
-              type="password"
-              label="Password"
-              placeholder="••••••••"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              autoComplete="current-password"
-            />
+            <div className="relative">
+              <Input
+                type={showPassword ? 'text' : 'password'}
+                label="Password"
+                placeholder="••••••••"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                autoComplete="current-password"
+                className="pr-14"
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword((s) => !s)}
+                tabIndex={-1}
+                aria-label={showPassword ? 'Hide password' : 'Show password'}
+                aria-pressed={showPassword}
+                className="absolute right-2 bottom-[7px] px-2 py-1 rounded text-xs text-zinc-400 hover:text-zinc-100 hover:bg-zinc-700/40 transition-colors"
+              >
+                {showPassword ? 'Hide' : 'Show'}
+              </button>
+            </div>
             {error && (
               <div className="text-sm text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">
                 {error}

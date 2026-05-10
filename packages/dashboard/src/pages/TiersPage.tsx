@@ -74,7 +74,7 @@ export function TiersPage({ showToast }: { showToast: ShowToast }) {
               emptyMessage="No tiers configured"
               columns={[
                 { key: 'name', header: 'Name', render: (t) => <span className="text-zinc-100 font-medium">{t.name}</span> },
-                { key: 'budget', header: 'Budget', render: (t) => <span className="text-zinc-300">{t.credit_budget.toFixed(0)}</span> },
+                { key: 'budget', header: 'Budget', render: (t) => <span className="text-zinc-300">{(Number(t.credit_budget) || 0).toFixed(0)}</span> },
                 { key: 'window', header: 'Window', render: (t) => <span className="text-zinc-400">{t.window_type}</span> },
                 {
                   key: 'pools',
